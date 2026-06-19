@@ -123,11 +123,12 @@ export async function migrate(
   try {
     records = await readMigrationRecords(sql, table);
   } catch (error) {
-    if (files[0]?.name !== INIT_MIGRATION_NAME) {
-      throw tableReadError(table, directory, error);
+    const hasBootstrapMigration = files[0]?.name === INIT_MIGRATION_NAME;
+    if (hasBootstrapMigration && isMissingMigrationTableError(error, table)) {
+      return applyPendingMigrations(sql, table, directory, files, []);
     }
 
-    return applyPendingMigrations(sql, table, directory, files, []);
+    throw tableReadError(table, directory, error, hasBootstrapMigration);
   }
 
   return applyPendingMigrations(sql, table, directory, files, records);
@@ -471,12 +472,57 @@ function outOfOrderMigrationError(
   );
 }
 
-function tableReadError(table: string, directory: string, cause: unknown): RatchetError {
+function tableReadError(
+  table: string,
+  directory: string,
+  cause: unknown,
+  hasBootstrapMigration: boolean,
+): RatchetError {
+  const detail = hasBootstrapMigration
+    ? `Ratchet found ${INIT_MIGRATION_NAME}, but it only bootstraps when the metadata table is missing. Check that "${table}" has the expected name, checksum, and applied_at columns.`
+    : `Ratchet also did not find ${INIT_MIGRATION_NAME} as the first migration in ${directory}, so it cannot bootstrap the metadata table. Run \`ratchet init --dir ${directory} --table ${table}\`, or check --dir, --table, and --url if this database was already initialized.`;
   const error = new RatchetError(
-    `could not read migration table "${table}". Ratchet also did not find ${INIT_MIGRATION_NAME} as the first migration in ${directory}, so it cannot bootstrap the metadata table. Run \`ratchet init --dir ${directory} --table ${table}\`, or check --dir, --table, and --url if this database was already initialized.`,
+    `could not read migration table "${table}". ${detail}`,
   );
   error.cause = cause;
   return error;
+}
+
+function isMissingMigrationTableError(error: unknown, table: string): boolean {
+  const code = errorCode(error);
+  const message = errorMessage(error).toLowerCase();
+  const normalizedTable = table.toLowerCase();
+
+  if (code === "SQLITE_ERROR") {
+    return message.includes(`no such table: ${normalizedTable}`);
+  }
+
+  if (code === "ER_NO_SUCH_TABLE") {
+    return true;
+  }
+
+  if (code === "42P01") {
+    return true;
+  }
+
+  if (code === "ERR_POSTGRES_SERVER_ERROR") {
+    return message.includes(`relation "${normalizedTable}" does not exist`);
+  }
+
+  return false;
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+
+  const code = error.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function initMigrationExistsError(path: string, directory: string): RatchetError {

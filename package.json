@@ -1,6 +1,6 @@
 {
   "name": "ratchet",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A small Bun-only SQL migrator built on Bun.SQL. Forward-only, file-based, works with PostgreSQL, MySQL, and SQLite.",
   "keywords": [
     "bun",

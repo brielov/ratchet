@@ -10,7 +10,7 @@ ratchet is not published to npm. Install it directly from GitHub and pin to
 a tag:
 
 ```sh
-bun add github:brielov/ratchet#v0.2.0
+bun add github:brielov/ratchet#v0.2.1
 ```
 
 You can also track `main`, but pinning to a tag is recommended:
@@ -61,9 +61,12 @@ that is your responsibility.
 
 ### Errors
 
-Every error ratchet throws is a `RatchetError`:
+Ratchet's validation and setup errors are `RatchetError`. Database read and
+execution errors from `Bun.SQL` are allowed to bubble with their original error
+type so callers can inspect adapter-specific details:
 
 ```ts
+import { SQL } from "bun";
 import { RatchetError, migrate } from "ratchet";
 
 try {
@@ -71,6 +74,10 @@ try {
 } catch (error) {
   if (error instanceof RatchetError) {
     console.error(error.message);
+    return;
+  }
+  if (error instanceof SQL.SQLError) {
+    console.error("database error:", error.message);
     return;
   }
   throw error;

@@ -128,3 +128,35 @@ bun src/cli.ts up --dir "$tmp/migrations" --url "sqlite://$tmp/app.db"
 bun src/cli.ts status --dir "$tmp/migrations" --url "sqlite://$tmp/app.db"
 rm -rf "$tmp"
 ```
+
+## Release Flow
+
+This package is installed directly from GitHub tags, so version metadata and
+the README install command must move together with every release tag.
+
+When preparing a release after code changes:
+
+1. Choose the next SemVer version and use a `v`-prefixed Git tag name, for
+   example `0.2.1` in `package.json` and `v0.2.1` in Git.
+2. Update `package.json` `"version"` to the new version.
+3. Update the README install example so `bun add github:brielov/ratchet#vX.Y.Z`
+   points to the same tag you are about to create.
+4. Run the verification commands above. Include the SQLite CLI smoke test when
+   CLI behavior changed.
+5. Commit the code, docs, `package.json`, README tag update, and any required
+   lockfile changes together.
+6. Create the annotated release tag on that commit, for example:
+
+   ```sh
+   git tag -a v0.2.1 -m "v0.2.1"
+   ```
+
+7. Push the commit and the tag:
+
+   ```sh
+   git push origin main
+   git push origin v0.2.1
+   ```
+
+Do not create or push a release tag until `package.json` and the README install
+example both reference that exact version.

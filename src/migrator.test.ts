@@ -9,6 +9,7 @@ import {
   getMigrationStatus,
   initMigrationDirectory,
   migrate,
+  RatchetError,
   slugifyMigrationName,
 } from "./migrator.ts";
 
@@ -226,6 +227,51 @@ test("migrate rejects a --table that does not match the bootstrap migration", as
       'configured table is "second_table"',
       "Pass --table first_table",
     ]);
+  } finally {
+    await sql.close();
+  }
+});
+
+test("migrate does not bootstrap when an existing metadata table is unreadable", async () => {
+  const directory = await tempDirectory();
+  await initMigrationDirectory(directory);
+  await Bun.write(
+    join(directory, "0001_create_widgets.sql"),
+    "CREATE TABLE widgets (name TEXT NOT NULL);",
+  );
+
+  const sql = new SQL(":memory:");
+  try {
+    await sql`CREATE TABLE ratchet_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL)`;
+
+    await expectRejectsWith(migrate(sql, directory), [
+      "could not read migration table",
+      "only bootstraps when the metadata table is missing",
+      "applied_at",
+    ]);
+    expect(await tableExists(sql, "widgets")).toBe(false);
+  } finally {
+    await sql.close();
+  }
+});
+
+test("migrate lets database execution errors bubble", async () => {
+  const directory = await tempDirectory();
+  await initMigrationDirectory(directory);
+  await Bun.write(join(directory, "0001_broken.sql"), "CREATE TABLE broken (");
+
+  const sql = new SQL(":memory:");
+  try {
+    try {
+      await migrate(sql, directory);
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(RatchetError);
+      expect(error instanceof Error ? error.message : String(error)).toContain("incomplete input");
+      return;
+    }
+
+    throw new Error("expected migration to fail");
   } finally {
     await sql.close();
   }
