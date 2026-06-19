@@ -50,8 +50,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint",
-    "format": "oxfmt",
-    "prepublishOnly": "bun test && bun run typecheck && bun run lint"
+    "format": "oxfmt"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -66,8 +65,5 @@
     "typescript": {
       "optional": true
     }
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }

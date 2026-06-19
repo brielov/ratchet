@@ -6,8 +6,17 @@ and works with every database engine `Bun.SQL` supports
 
 ## Install
 
+ratchet is not published to npm. Install it directly from GitHub and pin to
+a tag:
+
 ```sh
-bun add ratchet
+bun add github:brielov/ratchet#v0.1.0
+```
+
+You can also track `main`, but pinning to a tag is recommended:
+
+```sh
+bun add github:brielov/ratchet
 ```
 
 > Requires Bun. There is no Node fallback by design.
