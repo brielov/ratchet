@@ -95,7 +95,7 @@ ratchet init                 # writes migrations/0000_ratchet.sql
 ratchet create add_users     # writes migrations/0001_add_users.sql
 ratchet up                   # applies pending migrations
 ratchet status               # prints applied / pending / changed / missing
-ratchet clear                # clears the metadata table only
+ratchet drop                 # wipes the database so you can re-run migrations
 ```
 
 `ratchet create` accepts a free-form name and slugifies it. If you don't
@@ -117,18 +117,28 @@ lets Bun auto-detect from `DATABASE_URL`, `POSTGRES_URL`, `MYSQL_URL`, etc.
 > `0000_ratchet.sql`; if `--table` doesn't match what that file creates,
 > ratchet refuses to apply migrations and tells you which value to use.
 
-### `clear`
+### `drop`
 
-`ratchet clear` deletes every row from the metadata table. It does **not**
-drop application schema or data. Use it only on disposable development
-databases.
+`ratchet drop` is a development convenience that wipes the connected database
+so you can re-run every migration against a clean slate without recreating
+the database container or hand-running `DROP DATABASE`.
 
-It requires you to type the table name and `clear` to confirm, or pass
-`--yes` to skip the prompt. It is disabled when `NODE_ENV=production`.
+What it actually does depends on the engine:
 
-Re-running `ratchet up` after `clear` will replay every migration against
-the existing schema. For a true reset, drop the database and recreate it
-before running `up`.
+- **PostgreSQL.** `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` and
+  best-effort restore of default grants. Anything outside `public` is
+  untouched.
+- **MySQL / MariaDB.** Drops every table and view in the database currently
+  selected by the connection, with `FOREIGN_KEY_CHECKS` disabled for the
+  duration. The database itself is preserved.
+- **SQLite.** Closes the connection and deletes the database file along with
+  any `-journal`, `-wal`, and `-shm` sidecars. `:memory:` is a no-op (closing
+  the connection already discards it).
+
+It requires you to type `drop` to confirm, or pass `--yes` to skip the
+prompt. It is disabled when `NODE_ENV=production`.
+
+After `drop`, run `ratchet up` to replay every migration from scratch.
 
 ## Caveats
 

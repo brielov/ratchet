@@ -66,13 +66,23 @@ ratchet init
 ratchet create add_users
 ratchet up
 ratchet status
-ratchet clear
+ratchet drop
 ```
 
-`clear` deletes rows from the metadata table only; it does not drop schema or
-data. It is disabled when `NODE_ENV=production` and requires typed
-confirmation unless `--yes` is passed. Do not add a second name (e.g.
-`reset`) for the same behavior.
+`drop` is a development-only convenience that wipes the connected database so
+migrations can be replayed from scratch. The implementation branches on
+`sql.options.adapter`:
+
+- PostgreSQL: `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` plus
+  best-effort default grants.
+- MySQL / MariaDB: enumerates `information_schema.tables` for the current
+  database and drops every table and view with `FOREIGN_KEY_CHECKS=0`.
+- SQLite: closes the connection and unlinks the database file along with any
+  `-journal`, `-wal`, and `-shm` sidecars. `:memory:` is a no-op.
+
+`drop` is disabled when `NODE_ENV=production` and requires the user to type
+`drop` to confirm unless `--yes` is passed. Do not add a second name (e.g.
+`reset`, `clear`) for the same behavior.
 
 Defaults:
 

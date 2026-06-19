@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { SQL } from "bun";
+import { rm } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import {
   createMigrationFile,
@@ -9,7 +10,6 @@ import {
   getMigrationStatus,
   initMigrationDirectory,
   migrate,
-  normalizeTable,
 } from "./migrator.ts";
 
 type CliConfig = {
@@ -22,10 +22,6 @@ type CliConfig = {
   yes: boolean;
 };
 
-type MigrationRecordName = {
-  name: string;
-};
-
 const HELP = `ratchet
 
 Usage:
@@ -33,7 +29,7 @@ Usage:
   ratchet create [name] [--dir migrations]
   ratchet up [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
   ratchet status [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
-  ratchet clear [--table ratchet_migrations] [--url DATABASE_URL] [--yes]
+  ratchet drop [--url DATABASE_URL] [--yes]
 
 Environment:
   RATCHET_DIR
@@ -41,8 +37,11 @@ Environment:
   RATCHET_DATABASE_URL
 
 Safety:
-  clear only deletes Ratchet migration history; it does not drop schema or data.
-  clear is disabled when NODE_ENV=production.
+  drop wipes the connected database so migrations can be replayed from scratch.
+    PostgreSQL: DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+    MySQL/MariaDB: drops every table and view in the current database.
+    SQLite: deletes the database file (and -wal/-shm sidecars).
+  drop is disabled when NODE_ENV=production.
 `;
 
 export function parseCliConfig(argv = Bun.argv.slice(2)): CliConfig {
@@ -138,28 +137,35 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
       }
     }
 
-    case "clear": {
-      assertClearAllowed();
-      const table = normalizeTable(config.table);
+    case "drop": {
+      assertDropAllowed();
       const sql = openSql(config.url);
-      try {
-        const records = await readMigrationRecordNames(sql, table);
-        if (records.length === 0) {
-          console.log(`no migration records found in ${table}`);
-          return 0;
-        }
+      const adapter = getAdapter(sql);
+      const identifier = databaseIdentifier(sql, config.url);
+      let closed = false;
 
-        if (!confirmClear(config, records.length)) {
-          console.error("clear cancelled");
+      try {
+        if (!confirmDrop(config, identifier)) {
+          console.error("drop cancelled");
           return 1;
         }
 
-        await deleteMigrationRecords(sql, table);
-        console.log(`cleared ${records.length} migration record(s) from ${table}`);
-        console.log("database schema and data were not changed");
+        if (adapter === "sqlite") {
+          await sql.close();
+          closed = true;
+          await dropSqliteFile(identifier);
+        } else if (adapter === "mysql" || adapter === "mariadb") {
+          await dropMysqlObjects(sql);
+        } else {
+          await dropPostgresPublicSchema(sql);
+        }
+
+        console.log(`dropped ${identifier}`);
         return 0;
       } finally {
-        await sql.close();
+        if (!closed) {
+          await sql.close();
+        }
       }
     }
 
@@ -178,62 +184,164 @@ function openSql(url?: string): SQL {
   return url ? new SQL(url) : new SQL();
 }
 
-function assertClearAllowed(): void {
+function assertDropAllowed(): void {
   if ((Bun.env.NODE_ENV ?? "").toLowerCase() !== "production") {
     return;
   }
 
   throw new Error(
-    "ratchet clear is disabled when NODE_ENV=production; use it only with a disposable development database.",
+    "ratchet drop is disabled when NODE_ENV=production; use it only with a disposable development database.",
   );
 }
 
-async function readMigrationRecordNames(sql: SQL, table: string): Promise<MigrationRecordName[]> {
+type SqlOptionsShape = {
+  adapter?: string;
+  filename?: string;
+  database?: string;
+};
+
+function getAdapter(sql: SQL): string {
+  const opts = sql.options as SqlOptionsShape;
+  return opts.adapter ?? "postgres";
+}
+
+function databaseIdentifier(sql: SQL, url: string | undefined): string {
+  const opts = sql.options as SqlOptionsShape;
+
+  if (opts.adapter === "sqlite") {
+    if (typeof opts.filename === "string") {
+      return opts.filename;
+    }
+    return extractSqlitePath(url) ?? ":memory:";
+  }
+
+  if (opts.database) {
+    return opts.database;
+  }
+
+  return extractDatabaseFromUrl(url) ?? url ?? "(unknown)";
+}
+
+function extractSqlitePath(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+  return url.replace(/^sqlite:\/\//, "");
+}
+
+function extractDatabaseFromUrl(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+
   try {
-    return await sql<MigrationRecordName[]>`
-      SELECT name
-      FROM ${sql(table)}
-      ORDER BY name
-    `;
-  } catch (cause) {
-    const error = new Error(
-      `could not read migration table "${table}"; check --table and --url, or run \`ratchet up\` before clearing migration history.`,
-    );
-    error.cause = cause;
-    throw error;
+    const parsed = new URL(url);
+    const path = parsed.pathname;
+    if (!path || path === "/") {
+      return undefined;
+    }
+    return path.startsWith("/") ? path.slice(1) : path;
+  } catch {
+    return undefined;
   }
 }
 
-async function deleteMigrationRecords(sql: SQL, table: string): Promise<void> {
+async function dropSqliteFile(filename: string): Promise<void> {
+  if (filename === ":memory:" || filename === "") {
+    return;
+  }
+
+  await Promise.all([
+    rm(filename, { force: true }),
+    rm(`${filename}-journal`, { force: true }),
+    rm(`${filename}-wal`, { force: true }),
+    rm(`${filename}-shm`, { force: true }),
+  ]);
+}
+
+async function dropPostgresPublicSchema(sql: SQL): Promise<void> {
   try {
     await sql.begin(async (tx) => {
-      await tx`DELETE FROM ${tx(table)}`;
+      await tx`DROP SCHEMA IF EXISTS public CASCADE`;
+      await tx`CREATE SCHEMA public`;
     });
   } catch (cause) {
     const error = new Error(
-      `could not clear migration table "${table}"; check that the database user can delete from this table.`,
+      "could not drop and recreate the public schema; check that the connected user owns the database, or run drop against a disposable database.",
     );
     error.cause = cause;
     throw error;
   }
+
+  // Best-effort grants; some managed PostgreSQL providers restrict these.
+  for (const grant of [
+    sql`GRANT ALL ON SCHEMA public TO public`,
+    sql`GRANT ALL ON SCHEMA public TO CURRENT_USER`,
+  ]) {
+    try {
+      await grant;
+    } catch {
+      // ignore — grants are best-effort
+    }
+  }
 }
 
-function confirmClear(config: CliConfig, recordCount: number): boolean {
+async function dropMysqlObjects(sql: SQL): Promise<void> {
+  type Row = { table_name: string; table_type: string };
+
+  let rows: Row[];
+  try {
+    rows = await sql<Row[]>`
+      SELECT table_name AS table_name, table_type AS table_type
+      FROM information_schema.tables
+      WHERE table_schema = DATABASE()
+    `;
+  } catch (cause) {
+    const error = new Error(
+      "could not list tables to drop; check --url points at a database the connected user can read.",
+    );
+    error.cause = cause;
+    throw error;
+  }
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  try {
+    await sql`SET FOREIGN_KEY_CHECKS = 0`;
+    for (const row of rows) {
+      if (row.table_type === "VIEW") {
+        await sql`DROP VIEW IF EXISTS ${sql(row.table_name)}`;
+      } else {
+        await sql`DROP TABLE IF EXISTS ${sql(row.table_name)}`;
+      }
+    }
+  } catch (cause) {
+    const error = new Error(
+      "could not drop every object in the current database; check that the connected user has DROP privileges.",
+    );
+    error.cause = cause;
+    throw error;
+  } finally {
+    try {
+      await sql`SET FOREIGN_KEY_CHECKS = 1`;
+    } catch {
+      // ignore — connection may already be in a bad state
+    }
+  }
+}
+
+function confirmDrop(config: CliConfig, identifier: string): boolean {
   if (config.yes) {
     return true;
   }
 
-  console.log(`This will clear ${recordCount} migration record(s) from ${config.table}.`);
-  console.log("It only clears Ratchet migration history; it does not drop schema or data.");
-  console.log("Running `ratchet up` afterwards may replay migrations against the existing schema.");
+  console.log(`This will wipe all schema and data from ${identifier}.`);
+  console.log("Migrations will need to be replayed from scratch afterwards.");
 
-  const tableAnswer = prompt(`Type "${config.table}" to confirm the migration table: `);
-  if (tableAnswer !== config.table) {
-    return false;
-  }
-
-  const clearAnswer = prompt(`Type "clear" to clear ${recordCount} migration record(s): `);
-  return clearAnswer === "clear";
+  const answer = prompt(`Type "drop" to confirm: `);
+  return answer === "drop";
 }
 
 function printStatus(status: Awaited<ReturnType<typeof getMigrationStatus>>): void {

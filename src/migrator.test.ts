@@ -278,10 +278,11 @@ test("cli status fails when an applied migration file is missing", async () => {
   expect(code).toBe(1);
 });
 
-test("cli clear with --yes skips confirmation and preserves schema", async () => {
+test("cli drop with --yes wipes schema and lets migrations replay from scratch", async () => {
   const directory = await tempDirectory();
   const migrationsDirectory = join(directory, "migrations");
-  const databaseUrl = `sqlite://${join(directory, "app.db")}`;
+  const databasePath = join(directory, "app.db");
+  const databaseUrl = `sqlite://${databasePath}`;
   await initMigrationDirectory(migrationsDirectory);
   await Bun.write(
     join(migrationsDirectory, "0001_create_widgets.sql"),
@@ -295,25 +296,32 @@ test("cli clear with --yes skips confirmation and preserves schema", async () =>
     await sql.close();
   }
 
+  expect(await Bun.file(databasePath).exists()).toBe(true);
+
   const code = await withSilentConsole(() =>
-    main(["clear", "--dir", migrationsDirectory, "--url", databaseUrl, "--yes"]),
+    main(["drop", "--dir", migrationsDirectory, "--url", databaseUrl, "--yes"]),
   );
+
+  expect(code).toBe(0);
+  expect(await Bun.file(databasePath).exists()).toBe(false);
 
   const checkSql = new SQL(databaseUrl);
   try {
-    expect(code).toBe(0);
-    expect(await migrationNames(checkSql)).toEqual([]);
-    expect(await tableExists(checkSql, "widgets")).toBe(true);
+    expect(await tableExists(checkSql, "widgets")).toBe(false);
+    expect(await tableExists(checkSql, "ratchet_migrations")).toBe(false);
+    const replay = await migrate(checkSql, migrationsDirectory);
+    expect(replay.applied).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
     expect(await checkSql<{ name: string }[]>`SELECT name FROM widgets`).toEqual([{ name: "Ada" }]);
   } finally {
     await checkSql.close();
   }
 });
 
-test("cli clear accepts typed confirmations", async () => {
+test("cli drop accepts typed confirmation", async () => {
   const directory = await tempDirectory();
   const migrationsDirectory = join(directory, "migrations");
-  const databaseUrl = `sqlite://${join(directory, "app.db")}`;
+  const databasePath = join(directory, "app.db");
+  const databaseUrl = `sqlite://${databasePath}`;
   await initMigrationDirectory(migrationsDirectory);
 
   const sql = new SQL(databaseUrl);
@@ -323,23 +331,19 @@ test("cli clear accepts typed confirmations", async () => {
     await sql.close();
   }
 
-  const code = await withPrompt(["ratchet_migrations", "clear"], () =>
-    withSilentConsole(() => main(["clear", "--url", databaseUrl])),
+  const code = await withPrompt(["drop"], () =>
+    withSilentConsole(() => main(["drop", "--url", databaseUrl])),
   );
 
-  const checkSql = new SQL(databaseUrl);
-  try {
-    expect(code).toBe(0);
-    expect(await migrationNames(checkSql)).toEqual([]);
-  } finally {
-    await checkSql.close();
-  }
+  expect(code).toBe(0);
+  expect(await Bun.file(databasePath).exists()).toBe(false);
 });
 
-test("cli clear cancels when confirmation does not match", async () => {
+test("cli drop cancels when confirmation does not match", async () => {
   const directory = await tempDirectory();
   const migrationsDirectory = join(directory, "migrations");
-  const databaseUrl = `sqlite://${join(directory, "app.db")}`;
+  const databasePath = join(directory, "app.db");
+  const databaseUrl = `sqlite://${databasePath}`;
   await initMigrationDirectory(migrationsDirectory);
 
   const sql = new SQL(databaseUrl);
@@ -349,26 +353,28 @@ test("cli clear cancels when confirmation does not match", async () => {
     await sql.close();
   }
 
-  const code = await withPrompt(["wrong_table"], () =>
-    withSilentConsole(() => main(["clear", "--url", databaseUrl])),
+  const code = await withPrompt(["nope"], () =>
+    withSilentConsole(() => main(["drop", "--url", databaseUrl])),
   );
+
+  expect(code).toBe(1);
+  expect(await Bun.file(databasePath).exists()).toBe(true);
 
   const checkSql = new SQL(databaseUrl);
   try {
-    expect(code).toBe(1);
     expect(await migrationNames(checkSql)).toEqual(["0000_ratchet.sql"]);
   } finally {
     await checkSql.close();
   }
 });
 
-test("cli clear is disabled in production", async () => {
+test("cli drop is disabled in production", async () => {
   const oldNodeEnv = Bun.env.NODE_ENV;
 
   try {
     Bun.env.NODE_ENV = "production";
 
-    await expectRejectsWith(main(["clear", "--url", "sqlite://ignored.db", "--yes"]), [
+    await expectRejectsWith(main(["drop", "--url", "sqlite://ignored.db", "--yes"]), [
       "disabled",
       "NODE_ENV=production",
       "development database",
