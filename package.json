@@ -1,0 +1,73 @@
+{
+  "name": "ratchet",
+  "version": "0.1.0",
+  "description": "A small Bun-only SQL migrator built on Bun.SQL. Forward-only, file-based, works with PostgreSQL, MySQL, and SQLite.",
+  "keywords": [
+    "bun",
+    "bun.sql",
+    "migrate",
+    "migration",
+    "migrations",
+    "sql",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "sqlite",
+    "schema"
+  ],
+  "homepage": "https://github.com/brielov/ratchet#readme",
+  "bugs": "https://github.com/brielov/ratchet/issues",
+  "license": "MIT",
+  "author": "Gabriel Vaquer <brielov@icloud.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brielov/ratchet.git"
+  },
+  "type": "module",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "bin": {
+    "ratchet": "./src/cli.ts"
+  },
+  "files": [
+    "src/index.ts",
+    "src/migrator.ts",
+    "src/cli.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "format": "oxfmt",
+    "prepublishOnly": "bun test && bun run typecheck && bun run lint"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "oxfmt": "^0.55.0",
+    "oxlint": "^1.70.0",
+    "oxlint-tsgolint": "^0.23.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
