@@ -1,4 +1,5 @@
 import { SQL } from "bun";
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -93,6 +94,31 @@ test("migrate applies pending sql files and skips them on rerun", async () => {
     expect(rows).toEqual([{ name: "Ada" }]);
   } finally {
     await sql.close();
+  }
+});
+
+test("migrate accepts bun:sqlite databases for SQLite extension use cases", async () => {
+  const directory = await tempDirectory();
+  await initMigrationDirectory(directory);
+  await Bun.write(
+    join(directory, "0001_create_widgets.sql"),
+    "CREATE TABLE widgets (name TEXT NOT NULL); INSERT INTO widgets (name) VALUES ('Ada');",
+  );
+
+  const db = new Database(":memory:");
+  try {
+    const first = await migrate(db, directory);
+    const second = await migrate(db, directory);
+    const rows = db.query("SELECT name FROM widgets").all();
+    const status = await getMigrationStatus(db, directory);
+
+    expect(first.applied).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
+    expect(second.applied).toEqual([]);
+    expect(rows).toEqual([{ name: "Ada" }]);
+    expect(status.tableOk).toBe(true);
+    expect(status.pending).toEqual([]);
+  } finally {
+    db.close();
   }
 });
 
@@ -434,11 +460,15 @@ test("cli flags override Bun.env defaults", () => {
   const oldDirectory = Bun.env.RATCHET_DIR;
   const oldTable = Bun.env.RATCHET_TABLE;
   const oldUrl = Bun.env.RATCHET_DATABASE_URL;
+  const oldSqliteExtensions = Bun.env.RATCHET_SQLITE_EXTENSIONS;
+  const oldSqliteLibrary = Bun.env.RATCHET_SQLITE_LIBRARY;
 
   try {
     Bun.env.RATCHET_DIR = "env_migrations";
     Bun.env.RATCHET_TABLE = "env_table";
     Bun.env.RATCHET_DATABASE_URL = "sqlite://env.db";
+    Bun.env.RATCHET_SQLITE_EXTENSIONS = "env_one,env_two";
+    Bun.env.RATCHET_SQLITE_LIBRARY = "env_sqlite";
 
     const config = parseCliConfig([
       "up",
@@ -448,15 +478,43 @@ test("cli flags override Bun.env defaults", () => {
       "flag_table",
       "--url",
       "sqlite://flag.db",
+      "--sqlite-extension",
+      "flag_one",
+      "--sqlite-extension",
+      "flag_two",
+      "--sqlite-library",
+      "flag_sqlite",
     ]);
 
     expect(config.directory).toBe("flag_migrations");
     expect(config.table).toBe("flag_table");
     expect(config.url).toBe("sqlite://flag.db");
+    expect(config.sqliteExtensions).toEqual(["flag_one", "flag_two"]);
+    expect(config.sqliteLibrary).toBe("flag_sqlite");
   } finally {
     restoreEnv("RATCHET_DIR", oldDirectory);
     restoreEnv("RATCHET_TABLE", oldTable);
     restoreEnv("RATCHET_DATABASE_URL", oldUrl);
+    restoreEnv("RATCHET_SQLITE_EXTENSIONS", oldSqliteExtensions);
+    restoreEnv("RATCHET_SQLITE_LIBRARY", oldSqliteLibrary);
+  }
+});
+
+test("cli reads SQLite extension configuration from Bun.env", () => {
+  const oldSqliteExtensions = Bun.env.RATCHET_SQLITE_EXTENSIONS;
+  const oldSqliteLibrary = Bun.env.RATCHET_SQLITE_LIBRARY;
+
+  try {
+    Bun.env.RATCHET_SQLITE_EXTENSIONS = " first_ext,second_ext ,, third_ext ";
+    Bun.env.RATCHET_SQLITE_LIBRARY = "custom_sqlite";
+
+    const config = parseCliConfig(["status"]);
+
+    expect(config.sqliteExtensions).toEqual(["first_ext", "second_ext", "third_ext"]);
+    expect(config.sqliteLibrary).toBe("custom_sqlite");
+  } finally {
+    restoreEnv("RATCHET_SQLITE_EXTENSIONS", oldSqliteExtensions);
+    restoreEnv("RATCHET_SQLITE_LIBRARY", oldSqliteLibrary);
   }
 });
 

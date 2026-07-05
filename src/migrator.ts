@@ -1,4 +1,5 @@
 import { Glob, type SQL } from "bun";
+import type { Database as SQLiteDatabase } from "bun:sqlite";
 import { basename, join } from "node:path";
 import { mkdir, stat } from "node:fs/promises";
 
@@ -53,6 +54,8 @@ const NOUNS = [
 export type MigrateOptions = {
   table?: string;
 };
+
+export type RatchetConnection = SQL | SQLiteDatabase;
 
 export type MigrationFile = {
   name: string;
@@ -109,7 +112,7 @@ export class RatchetError extends Error {
 }
 
 export async function migrate(
-  sql: SQL,
+  sql: RatchetConnection,
   directory: string,
   options: MigrateOptions = {},
 ): Promise<MigrateResult> {
@@ -135,7 +138,7 @@ export async function migrate(
 }
 
 export async function getMigrationStatus(
-  sql: SQL,
+  sql: RatchetConnection,
   directory: string,
   options: MigrateOptions = {},
 ): Promise<MigrationStatus> {
@@ -229,7 +232,7 @@ export function normalizeTable(table = DEFAULT_TABLE): string {
 }
 
 async function applyPendingMigrations(
-  sql: SQL,
+  sql: RatchetConnection,
   table: string,
   directory: string,
   files: MigrationFile[],
@@ -280,17 +283,7 @@ async function applyPendingMigrations(
   }
 
   if (pending.length > 0) {
-    await sql.begin(async (tx) => {
-      for (const file of pending) {
-        if (!file.empty) {
-          await tx.file(file.path);
-        }
-        await tx`
-          INSERT INTO ${tx(table)} (name, checksum)
-          VALUES (${file.name}, ${file.checksum})
-        `;
-      }
-    });
+    await applyPendingMigrationFiles(sql, table, pending);
   }
 
   return {
@@ -351,7 +344,66 @@ function buildStatus(
   };
 }
 
-async function readMigrationRecords(sql: SQL, table: string): Promise<MigrationRecord[]> {
+async function applyPendingMigrationFiles(
+  sql: RatchetConnection,
+  table: string,
+  pending: MigrationFile[],
+): Promise<void> {
+  if (isSQLiteDatabase(sql)) {
+    const migrations = await Promise.all(
+      pending.map(async (file) => ({
+        file,
+        contents: file.empty ? "" : await Bun.file(file.path).text(),
+      })),
+    );
+
+    const apply = sql.transaction(
+      (items: Array<{ file: MigrationFile; contents: string }>) => {
+        for (const item of items) {
+          if (item.contents.length > 0) {
+            sql.run(item.contents);
+          }
+          sql
+            .query(`INSERT INTO ${table} (name, checksum) VALUES ($name, $checksum)`)
+            .run({
+              $name: item.file.name,
+              $checksum: item.file.checksum,
+            });
+        }
+      },
+    );
+
+    apply(migrations);
+    return;
+  }
+
+  await sql.begin(async (tx) => {
+    for (const file of pending) {
+      if (!file.empty) {
+        await tx.file(file.path);
+      }
+      await tx`
+        INSERT INTO ${tx(table)} (name, checksum)
+        VALUES (${file.name}, ${file.checksum})
+      `;
+    }
+  });
+}
+
+async function readMigrationRecords(
+  sql: RatchetConnection,
+  table: string,
+): Promise<MigrationRecord[]> {
+  if (isSQLiteDatabase(sql)) {
+    return sql
+      .query(
+        `SELECT name, checksum, applied_at
+         FROM ${table}
+         ORDER BY name`,
+      )
+      .all() as MigrationRecord[];
+  }
+
   return await sql<MigrationRecord[]>`
     SELECT name, checksum, applied_at
     FROM ${sql(table)}
@@ -448,6 +500,15 @@ function sha256(input: string): string {
   return new Bun.CryptoHasher("sha256").update(input).digest("hex");
 }
 
+function isSQLiteDatabase(sql: RatchetConnection): sql is SQLiteDatabase {
+  return (
+    "query" in sql &&
+    typeof sql.query === "function" &&
+    "run" in sql &&
+    typeof sql.run === "function"
+  );
+}
+
 function checksumError(changed: ChangedMigration[]): RatchetError {
   const names = changed.map((change) => change.name).join(", ");
   return new RatchetError(
@@ -492,6 +553,10 @@ function isMissingMigrationTableError(error: unknown, table: string): boolean {
   const code = errorCode(error);
   const message = errorMessage(error).toLowerCase();
   const normalizedTable = table.toLowerCase();
+
+  if (message.includes(`no such table: ${normalizedTable}`)) {
+    return true;
+  }
 
   if (code === "SQLITE_ERROR") {
     return message.includes(`no such table: ${normalizedTable}`);

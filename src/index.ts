@@ -6,4 +6,5 @@ export type {
   MigrationFile,
   MigrationRecord,
   MigrationStatus,
+  RatchetConnection,
 } from "./migrator.ts";

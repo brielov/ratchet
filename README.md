@@ -2,7 +2,8 @@
 
 A small Bun-only SQL migrator built on `Bun.SQL`. Forward-only, file-based,
 and works with every database engine `Bun.SQL` supports
-(PostgreSQL, MySQL, SQLite).
+(PostgreSQL, MySQL, SQLite). For SQLite extension use cases, ratchet can also
+run against a `bun:sqlite` `Database`.
 
 ## Install
 
@@ -10,7 +11,7 @@ ratchet is not published to npm. Install it directly from GitHub and pin to
 a tag:
 
 ```sh
-bun add github:brielov/ratchet#v0.2.1
+bun add github:brielov/ratchet#v0.3.0
 ```
 
 You can also track `main`, but pinning to a tag is recommended:
@@ -38,8 +39,28 @@ try {
 
 `migrate(sql, directory, options?)` reads every top-level `*.sql` file in
 `directory`, sorts them lexicographically, and applies the pending ones inside
-a single `sql.begin` transaction. It does **not** close the connection —
-that is your responsibility.
+a single transaction. It does **not** close the connection — that is your
+responsibility.
+
+For SQLite extensions, load them on a `bun:sqlite` connection and pass that
+connection to the same `migrate` function:
+
+```ts
+import { Database } from "bun:sqlite";
+import { migrate } from "ratchet";
+
+const db = new Database("app.db");
+try {
+  db.loadExtension("./sqlite_vec");
+  await migrate(db, "migrations");
+} finally {
+  db.close();
+}
+```
+
+This is a narrow workaround for the current `Bun.SQL` SQLite adapter, which
+does not expose extension loading yet. Track upstream Bun issue
+[#22063](https://github.com/oven-sh/bun/issues/22063) for the native fix.
 
 ### Options
 
@@ -115,9 +136,30 @@ pass a name, a memorable random one is generated.
 | `--dir`   | `RATCHET_DIR`          | `migrations`                    |
 | `--table` | `RATCHET_TABLE`        | `ratchet_migrations`          |
 | `--url`   | `RATCHET_DATABASE_URL` | Bun's auto-detected env vars    |
+| `--sqlite-extension` | `RATCHET_SQLITE_EXTENSIONS` | unset |
+| `--sqlite-library` | `RATCHET_SQLITE_LIBRARY` | unset |
 
 Flags override env vars. If no URL is set, ratchet calls `new SQL()` and
 lets Bun auto-detect from `DATABASE_URL`, `POSTGRES_URL`, `MYSQL_URL`, etc.
+
+`--sqlite-extension` may be passed more than once. The env var form accepts a
+comma-separated list. When any SQLite extension or custom SQLite library is
+configured, `ratchet up` and `ratchet status` use `bun:sqlite` instead of
+`Bun.SQL`, so the extension is loaded on the same connection that runs the
+migrations.
+
+```sh
+ratchet up --url sqlite://app.db --sqlite-extension ./sqlite_vec
+```
+
+On macOS, extension loading may require a Homebrew SQLite library:
+
+```sh
+ratchet up \
+  --url sqlite://app.db \
+  --sqlite-library /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib \
+  --sqlite-extension ./sqlite_vec
+```
 
 > [!IMPORTANT]
 > Use the same `--table` for `init` and `up`. The metadata table is created by
@@ -154,5 +196,5 @@ After `drop`, run `ratchet up` to replay every migration from scratch.
   the same database.
 - **Connection ownership.** `migrate(sql, ...)` does not close `sql`.
 - **Single-transaction apply.** All pending migrations run inside one
-  `sql.begin`. DDL that cannot run inside a transaction (for example
+  transaction. DDL that cannot run inside a transaction (for example
   `CREATE INDEX CONCURRENTLY` on PostgreSQL) is not supported.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { SQL } from "bun";
+import { Database } from "bun:sqlite";
 import { rm } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import {
@@ -10,6 +11,7 @@ import {
   getMigrationStatus,
   initMigrationDirectory,
   migrate,
+  type RatchetConnection,
 } from "./migrator.ts";
 
 type CliConfig = {
@@ -20,6 +22,8 @@ type CliConfig = {
   title?: string;
   help: boolean;
   yes: boolean;
+  sqliteExtensions: string[];
+  sqliteLibrary?: string;
 };
 
 const HELP = `ratchet
@@ -27,14 +31,22 @@ const HELP = `ratchet
 Usage:
   ratchet init [--dir migrations] [--table ratchet_migrations]
   ratchet create [name] [--dir migrations]
-  ratchet up [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
-  ratchet status [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
+  ratchet up [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL] [--sqlite-extension PATH]
+  ratchet status [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL] [--sqlite-extension PATH]
   ratchet drop [--url DATABASE_URL] [--yes]
 
 Environment:
   RATCHET_DIR
   RATCHET_TABLE
   RATCHET_DATABASE_URL
+  RATCHET_SQLITE_EXTENSIONS
+  RATCHET_SQLITE_LIBRARY
+
+SQLite:
+  --sqlite-extension PATH may be passed more than once. When set, ratchet uses
+  bun:sqlite for up/status so SQLite extensions can be loaded before migrations.
+  --sqlite-library PATH sets bun:sqlite's custom SQLite library before opening
+  the database, which is useful on macOS builds that disable extension loading.
 
 Safety:
   drop wipes the connected database so migrations can be replayed from scratch.
@@ -70,10 +82,18 @@ export function parseCliConfig(argv = Bun.argv.slice(2)): CliConfig {
         type: "boolean",
         short: "y",
       },
+      "sqlite-extension": {
+        type: "string",
+        multiple: true,
+      },
+      "sqlite-library": {
+        type: "string",
+      },
     },
   });
 
   const [command, ...titleParts] = positionals;
+  const sqliteExtensionFlags = values["sqlite-extension"];
 
   return {
     command,
@@ -83,6 +103,11 @@ export function parseCliConfig(argv = Bun.argv.slice(2)): CliConfig {
     title: titleParts.join(" ") || undefined,
     help: values.help ?? false,
     yes: values.yes ?? false,
+    sqliteExtensions:
+      sqliteExtensionFlags !== undefined
+        ? sqliteExtensionFlags
+        : splitEnvList(Bun.env.RATCHET_SQLITE_EXTENSIONS),
+    sqliteLibrary: values["sqlite-library"] ?? Bun.env.RATCHET_SQLITE_LIBRARY,
   };
 }
 
@@ -108,7 +133,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
     }
 
     case "up": {
-      const sql = openSql(config.url);
+      const sql = openMigratorConnection(config);
       try {
         const result = await migrate(sql, config.directory, { table: config.table });
         if (result.applied.length === 0) {
@@ -122,18 +147,18 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
         }
         return 0;
       } finally {
-        await sql.close();
+        await closeMigratorConnection(sql);
       }
     }
 
     case "status": {
-      const sql = openSql(config.url);
+      const sql = openMigratorConnection(config);
       try {
         const status = await getMigrationStatus(sql, config.directory, { table: config.table });
         printStatus(status);
         return status.tableOk && status.changed.length === 0 && status.missing.length === 0 ? 0 : 1;
       } finally {
-        await sql.close();
+        await closeMigratorConnection(sql);
       }
     }
 
@@ -184,6 +209,61 @@ function openSql(url?: string): SQL {
   return url ? new SQL(url) : new SQL();
 }
 
+function openMigratorConnection(config: CliConfig): RatchetConnection {
+  if (!shouldUseSQLiteDatabase(config)) {
+    return openSql(config.url);
+  }
+
+  const filename = sqliteFilenameForConfig(config);
+
+  if (config.sqliteLibrary !== undefined) {
+    Database.setCustomSQLite(config.sqliteLibrary);
+  }
+
+  const db = new Database(filename);
+  try {
+    for (const extension of config.sqliteExtensions) {
+      db.loadExtension(extension);
+    }
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+
+  return db;
+}
+
+async function closeMigratorConnection(sql: RatchetConnection): Promise<void> {
+  await sql.close();
+}
+
+function shouldUseSQLiteDatabase(config: CliConfig): boolean {
+  return config.sqliteExtensions.length > 0 || config.sqliteLibrary !== undefined;
+}
+
+function sqliteFilenameForConfig(config: CliConfig): string {
+  const filename = extractSqlitePath(config.url ?? Bun.env.DATABASE_URL);
+
+  if (filename !== undefined) {
+    return filename;
+  }
+
+  throw new Error(
+    "SQLite extension loading requires a SQLite database URL from --url, RATCHET_DATABASE_URL, or DATABASE_URL. Use :memory:, sqlite://..., sqlite:..., file://..., or file:....",
+  );
+}
+
+function splitEnvList(value: string | undefined): string[] {
+  if (value === undefined || value.trim() === "") {
+    return [];
+  }
+
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
 function assertDropAllowed(): void {
   if ((Bun.env.NODE_ENV ?? "").toLowerCase() !== "production") {
     return;
@@ -226,7 +306,24 @@ function extractSqlitePath(url: string | undefined): string | undefined {
   if (!url) {
     return undefined;
   }
-  return url.replace(/^sqlite:\/\//, "");
+
+  if (url === ":memory:") {
+    return url;
+  }
+
+  for (const prefix of ["sqlite://", "sqlite:", "file://", "file:"]) {
+    if (url.startsWith(prefix)) {
+      const filename = stripUrlSuffix(url.slice(prefix.length));
+      return filename === "" ? undefined : decodeURI(filename);
+    }
+  }
+
+  return undefined;
+}
+
+function stripUrlSuffix(value: string): string {
+  const marker = value.search(/[?#]/);
+  return marker === -1 ? value : value.slice(0, marker);
 }
 
 function extractDatabaseFromUrl(url: string | undefined): string | undefined {
