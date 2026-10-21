@@ -1,17 +1,15 @@
 #!/usr/bin/env bun
 
 import { SQL } from "bun";
-import { Database } from "bun:sqlite";
-import { rm } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import {
   createMigrationFile,
   DEFAULT_DIRECTORY,
   DEFAULT_TABLE,
   getMigrationStatus,
-  initMigrationDirectory,
   migrate,
-  type RatchetConnection,
+  MigrationError,
+  type MigrationStatus,
 } from "./migrator.ts";
 
 type CliConfig = {
@@ -21,40 +19,28 @@ type CliConfig = {
   url?: string;
   title?: string;
   help: boolean;
-  yes: boolean;
-  sqliteExtensions: string[];
-  sqliteLibrary?: string;
 };
 
 const HELP = `ratchet
 
 Usage:
-  ratchet init [--dir migrations] [--table ratchet_migrations]
-  ratchet create [name] [--dir migrations]
-  ratchet up [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL] [--sqlite-extension PATH]
-  ratchet status [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL] [--sqlite-extension PATH]
-  ratchet drop [--url DATABASE_URL] [--yes]
+  ratchet create <name> [--dir migrations]
+  ratchet up [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
+  ratchet status [--dir migrations] [--table ratchet_migrations] [--url DATABASE_URL]
 
 Environment:
   RATCHET_DIR
   RATCHET_TABLE
   RATCHET_DATABASE_URL
-  RATCHET_SQLITE_EXTENSIONS
-  RATCHET_SQLITE_LIBRARY
 
-SQLite:
-  --sqlite-extension PATH may be passed more than once. When set, ratchet uses
-  bun:sqlite for up/status so SQLite extensions can be loaded before migrations.
-  --sqlite-library PATH sets bun:sqlite's custom SQLite library before opening
-  the database, which is useful on macOS builds that disable extension loading.
-
-Safety:
-  drop wipes the connected database so migrations can be replayed from scratch.
-    PostgreSQL: DROP SCHEMA public CASCADE; CREATE SCHEMA public;
-    MySQL/MariaDB: drops every table and view in the current database.
-    SQLite: deletes the database file (and -wal/-shm sidecars).
-  drop is disabled when NODE_ENV=production.
+Without --url or RATCHET_DATABASE_URL, Bun.SQL reads DATABASE_URL and its
+other supported environment variables.
 `;
+
+const REMOVED_COMMANDS: Record<string, string> = {
+  init: "ratchet init was removed; the metadata table is now created automatically. Use `ratchet create <name>` to add a migration.",
+  drop: "ratchet drop was removed; drop and recreate development databases with your database's own tooling.",
+};
 
 export function parseCliConfig(argv = Bun.argv.slice(2)): CliConfig {
   const { values, positionals } = parseArgs({
@@ -62,52 +48,23 @@ export function parseCliConfig(argv = Bun.argv.slice(2)): CliConfig {
     allowPositionals: true,
     strict: true,
     options: {
-      dir: {
-        type: "string",
-        short: "d",
-      },
-      table: {
-        type: "string",
-        short: "t",
-      },
-      url: {
-        type: "string",
-        short: "u",
-      },
-      help: {
-        type: "boolean",
-        short: "h",
-      },
-      yes: {
-        type: "boolean",
-        short: "y",
-      },
-      "sqlite-extension": {
-        type: "string",
-        multiple: true,
-      },
-      "sqlite-library": {
-        type: "string",
-      },
+      dir: { type: "string", short: "d" },
+      table: { type: "string", short: "t" },
+      url: { type: "string", short: "u" },
+      help: { type: "boolean", short: "h" },
     },
   });
 
   const [command, ...titleParts] = positionals;
-  const sqliteExtensionFlags = values["sqlite-extension"];
 
   return {
     command,
-    directory: values.dir ?? Bun.env.RATCHET_DIR ?? DEFAULT_DIRECTORY,
-    table: values.table ?? Bun.env.RATCHET_TABLE ?? DEFAULT_TABLE,
-    url: values.url ?? Bun.env.RATCHET_DATABASE_URL,
+    // `||` so empty values (e.g. `RATCHET_DIR=` in a .env file) count as unset.
+    directory: values.dir || Bun.env.RATCHET_DIR || DEFAULT_DIRECTORY,
+    table: values.table || Bun.env.RATCHET_TABLE || DEFAULT_TABLE,
+    url: values.url || Bun.env.RATCHET_DATABASE_URL || undefined,
     title: titleParts.join(" ") || undefined,
     help: values.help ?? false,
-    yes: values.yes ?? false,
-    sqliteExtensions:
-      sqliteExtensionFlags !== undefined
-        ? sqliteExtensionFlags
-        : splitEnvList(Bun.env.RATCHET_SQLITE_EXTENSIONS),
-    sqliteLibrary: values["sqlite-library"] ?? Bun.env.RATCHET_SQLITE_LIBRARY,
   };
 }
 
@@ -120,20 +77,20 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
   }
 
   switch (config.command) {
-    case "init": {
-      const result = await initMigrationDirectory(config.directory, config.table);
-      console.log(`created ${result.path}`);
-      return 0;
-    }
-
     case "create": {
+      if (config.title === undefined) {
+        console.error(
+          "ratchet create needs a migration name, for example `ratchet create add_users`.",
+        );
+        return 1;
+      }
       const result = await createMigrationFile(config.directory, config.title);
       console.log(`created ${result.path}`);
       return 0;
     }
 
     case "up": {
-      const sql = openMigratorConnection(config);
+      const sql = config.url ? new SQL(config.url) : new SQL();
       try {
         const result = await migrate(sql, config.directory, { table: config.table });
         if (result.applied.length === 0) {
@@ -142,55 +99,31 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
         }
 
         console.log(`applied ${result.applied.length} migration(s)`);
-        for (const name of result.applied) {
-          console.log(`  ${name}`);
-        }
+        printNames(result.applied);
         return 0;
+      } catch (error) {
+        if (error instanceof MigrationError && error.applied.length > 0) {
+          console.error(`applied ${error.applied.length} migration(s) before the failure`);
+          printNames(error.applied, console.error);
+        }
+        throw error;
       } finally {
-        await closeMigratorConnection(sql);
+        await sql.close();
       }
     }
 
     case "status": {
-      const sql = openMigratorConnection(config);
+      const sql = config.url ? new SQL(config.url) : new SQL();
       try {
         const status = await getMigrationStatus(sql, config.directory, { table: config.table });
-        printStatus(status);
-        return status.tableOk && status.changed.length === 0 && status.missing.length === 0 ? 0 : 1;
+        printStatus(config, status);
+        const clean =
+          status.changed.length === 0 &&
+          status.missing.length === 0 &&
+          status.outOfOrder.length === 0;
+        return clean ? 0 : 1;
       } finally {
-        await closeMigratorConnection(sql);
-      }
-    }
-
-    case "drop": {
-      assertDropAllowed();
-      const sql = openSql(config.url);
-      const adapter = getAdapter(sql);
-      const identifier = databaseIdentifier(sql, config.url);
-      let closed = false;
-
-      try {
-        if (!confirmDrop(config, identifier)) {
-          console.error("drop cancelled");
-          return 1;
-        }
-
-        if (adapter === "sqlite") {
-          await sql.close();
-          closed = true;
-          await dropSqliteFile(identifier);
-        } else if (adapter === "mysql" || adapter === "mariadb") {
-          await dropMysqlObjects(sql);
-        } else {
-          await dropPostgresPublicSchema(sql);
-        }
-
-        console.log(`dropped ${identifier}`);
-        return 0;
-      } finally {
-        if (!closed) {
-          await sql.close();
-        }
+        await sql.close();
       }
     }
 
@@ -198,264 +131,25 @@ export async function main(argv = Bun.argv.slice(2)): Promise<number> {
       console.error(HELP);
       return 1;
 
-    default:
-      console.error(`unknown command: ${config.command}`);
-      console.error(HELP);
+    default: {
+      const removed = REMOVED_COMMANDS[config.command];
+      console.error(removed ?? `unknown command: ${config.command}\n\n${HELP}`);
       return 1;
-  }
-}
-
-function openSql(url?: string): SQL {
-  return url ? new SQL(url) : new SQL();
-}
-
-function openMigratorConnection(config: CliConfig): RatchetConnection {
-  if (!shouldUseSQLiteDatabase(config)) {
-    return openSql(config.url);
-  }
-
-  const filename = sqliteFilenameForConfig(config);
-
-  if (config.sqliteLibrary !== undefined) {
-    Database.setCustomSQLite(config.sqliteLibrary);
-  }
-
-  const db = new Database(filename);
-  try {
-    for (const extension of config.sqliteExtensions) {
-      db.loadExtension(extension);
-    }
-  } catch (error) {
-    db.close();
-    throw error;
-  }
-
-  return db;
-}
-
-async function closeMigratorConnection(sql: RatchetConnection): Promise<void> {
-  await sql.close();
-}
-
-function shouldUseSQLiteDatabase(config: CliConfig): boolean {
-  return config.sqliteExtensions.length > 0 || config.sqliteLibrary !== undefined;
-}
-
-function sqliteFilenameForConfig(config: CliConfig): string {
-  const filename = extractSqlitePath(config.url ?? Bun.env.DATABASE_URL);
-
-  if (filename !== undefined) {
-    return filename;
-  }
-
-  throw new Error(
-    "SQLite extension loading requires a SQLite database URL from --url, RATCHET_DATABASE_URL, or DATABASE_URL. Use :memory:, sqlite://..., sqlite:..., file://..., or file:....",
-  );
-}
-
-function splitEnvList(value: string | undefined): string[] {
-  if (value === undefined || value.trim() === "") {
-    return [];
-  }
-
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-}
-
-function assertDropAllowed(): void {
-  if ((Bun.env.NODE_ENV ?? "").toLowerCase() !== "production") {
-    return;
-  }
-
-  throw new Error(
-    "ratchet drop is disabled when NODE_ENV=production; use it only with a disposable development database.",
-  );
-}
-
-type SqlOptionsShape = {
-  adapter?: string;
-  filename?: string;
-  database?: string;
-};
-
-function getAdapter(sql: SQL): string {
-  const opts = sql.options as SqlOptionsShape;
-  return opts.adapter ?? "postgres";
-}
-
-function databaseIdentifier(sql: SQL, url: string | undefined): string {
-  const opts = sql.options as SqlOptionsShape;
-
-  if (opts.adapter === "sqlite") {
-    if (typeof opts.filename === "string") {
-      return opts.filename;
-    }
-    return extractSqlitePath(url) ?? ":memory:";
-  }
-
-  if (opts.database) {
-    return opts.database;
-  }
-
-  return extractDatabaseFromUrl(url) ?? url ?? "(unknown)";
-}
-
-function extractSqlitePath(url: string | undefined): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-
-  if (url === ":memory:") {
-    return url;
-  }
-
-  for (const prefix of ["sqlite://", "sqlite:", "file://", "file:"]) {
-    if (url.startsWith(prefix)) {
-      const filename = stripUrlSuffix(url.slice(prefix.length));
-      return filename === "" ? undefined : decodeURI(filename);
-    }
-  }
-
-  return undefined;
-}
-
-function stripUrlSuffix(value: string): string {
-  const marker = value.search(/[?#]/);
-  return marker === -1 ? value : value.slice(0, marker);
-}
-
-function extractDatabaseFromUrl(url: string | undefined): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname;
-    if (!path || path === "/") {
-      return undefined;
-    }
-    return path.startsWith("/") ? path.slice(1) : path;
-  } catch {
-    return undefined;
-  }
-}
-
-async function dropSqliteFile(filename: string): Promise<void> {
-  if (filename === ":memory:" || filename === "") {
-    return;
-  }
-
-  await Promise.all([
-    rm(filename, { force: true }),
-    rm(`${filename}-journal`, { force: true }),
-    rm(`${filename}-wal`, { force: true }),
-    rm(`${filename}-shm`, { force: true }),
-  ]);
-}
-
-async function dropPostgresPublicSchema(sql: SQL): Promise<void> {
-  try {
-    await sql.begin(async (tx) => {
-      await tx`DROP SCHEMA IF EXISTS public CASCADE`;
-      await tx`CREATE SCHEMA public`;
-    });
-  } catch (cause) {
-    const error = new Error(
-      "could not drop and recreate the public schema; check that the connected user owns the database, or run drop against a disposable database.",
-    );
-    error.cause = cause;
-    throw error;
-  }
-
-  // Best-effort grants; some managed PostgreSQL providers restrict these.
-  for (const grant of [
-    sql`GRANT ALL ON SCHEMA public TO public`,
-    sql`GRANT ALL ON SCHEMA public TO CURRENT_USER`,
-  ]) {
-    try {
-      await grant;
-    } catch {
-      // ignore — grants are best-effort
     }
   }
 }
 
-async function dropMysqlObjects(sql: SQL): Promise<void> {
-  type Row = { table_name: string; table_type: string };
-
-  let rows: Row[];
-  try {
-    rows = await sql<Row[]>`
-      SELECT table_name AS table_name, table_type AS table_type
-      FROM information_schema.tables
-      WHERE table_schema = DATABASE()
-    `;
-  } catch (cause) {
-    const error = new Error(
-      "could not list tables to drop; check --url points at a database the connected user can read.",
-    );
-    error.cause = cause;
-    throw error;
-  }
-
-  if (rows.length === 0) {
-    return;
-  }
-
-  try {
-    await sql`SET FOREIGN_KEY_CHECKS = 0`;
-    for (const row of rows) {
-      if (row.table_type === "VIEW") {
-        await sql`DROP VIEW IF EXISTS ${sql(row.table_name)}`;
-      } else {
-        await sql`DROP TABLE IF EXISTS ${sql(row.table_name)}`;
-      }
-    }
-  } catch (cause) {
-    const error = new Error(
-      "could not drop every object in the current database; check that the connected user has DROP privileges.",
-    );
-    error.cause = cause;
-    throw error;
-  } finally {
-    try {
-      await sql`SET FOREIGN_KEY_CHECKS = 1`;
-    } catch {
-      // ignore — connection may already be in a bad state
-    }
+function printNames(names: string[], print = console.log): void {
+  for (const name of names) {
+    print(`  ${name}`);
   }
 }
 
-function confirmDrop(config: CliConfig, identifier: string): boolean {
-  if (config.yes) {
-    return true;
-  }
-
-  console.log(`This will wipe all schema and data from ${identifier}.`);
-  console.log("Migrations will need to be replayed from scratch afterwards.");
-
-  const answer = prompt(`Type "drop" to confirm: `);
-  return answer === "drop";
-}
-
-function printStatus(status: Awaited<ReturnType<typeof getMigrationStatus>>): void {
-  console.log(`directory: ${status.directory}`);
-  console.log(`table: ${status.table}`);
-
-  if (!status.tableOk) {
-    console.log("table: missing or unreadable");
-    if (status.tableError) {
-      console.log(status.tableError);
-    }
-  }
-
-  console.log(`applied: ${status.applied.length}`);
+function printStatus(config: CliConfig, status: MigrationStatus): void {
+  console.log(`directory: ${config.directory}`);
+  console.log(`table: ${config.table}`);
+  console.log(`applied: ${status.records.length}`);
   console.log(`pending: ${status.pending.length}`);
-  console.log(`changed: ${status.changed.length}`);
-  console.log(`missing: ${status.missing.length}`);
 
   for (const file of status.pending) {
     console.log(`  pending ${file.name}`);
@@ -467,6 +161,10 @@ function printStatus(status: Awaited<ReturnType<typeof getMigrationStatus>>): vo
 
   for (const record of status.missing) {
     console.log(`  missing ${record.name}`);
+  }
+
+  for (const file of status.outOfOrder) {
+    console.log(`  out of order ${file.name}`);
   }
 }
 

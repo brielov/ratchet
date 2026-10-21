@@ -1,9 +1,8 @@
 # ratchet
 
-A small Bun-only SQL migrator built on `Bun.SQL`. Forward-only, file-based,
-and works with every database engine `Bun.SQL` supports
-(PostgreSQL, MySQL, SQLite). For SQLite extension use cases, ratchet can also
-run against a `bun:sqlite` `Database`.
+A small, strict, forward-only SQL migrator for `Bun.SQL`. Plain `.sql` files,
+applied in order, one transaction each, never twice. Works with every engine
+`Bun.SQL` supports: PostgreSQL, MySQL, MariaDB, and SQLite.
 
 ## Install
 
@@ -11,16 +10,12 @@ ratchet is not published to npm. Install it directly from GitHub and pin to
 a tag:
 
 ```sh
-bun add github:brielov/ratchet#v0.3.0
+bun add github:brielov/ratchet#v0.4.0
 ```
 
-You can also track `main`, but pinning to a tag is recommended:
-
-```sh
-bun add github:brielov/ratchet
-```
-
-> Requires Bun. There is no Node fallback by design.
+> Requires Bun 1.4.0 or newer. There is no Node fallback by design. Bun 1.3.x
+> reports a failed migration's database error a second time as an unhandled
+> rejection, which can crash your process.
 
 ## Library
 
@@ -37,164 +32,158 @@ try {
 }
 ```
 
-`migrate(sql, directory, options?)` reads every top-level `*.sql` file in
-`directory`, sorts them lexicographically, and applies the pending ones inside
-a single transaction. It does **not** close the connection — that is your
-responsibility.
+`migrate(sql, directory?, options?)` creates the metadata table if needed,
+then applies every pending migration in `directory` (default `migrations`).
+It resolves to `{ applied, alreadyApplied }`, two lists of file names. It does
+**not** close the connection.
 
-For SQLite extensions, load them on a `bun:sqlite` connection and pass that
-connection to the same `migrate` function:
+| Option  | Default              | Description                        |
+| ------- | -------------------- | ---------------------------------- |
+| `table` | `ratchet_migrations` | Name of the metadata table to use. |
 
-```ts
-import { Database } from "bun:sqlite";
-import { migrate } from "ratchet";
+It is safe to call `migrate` on every app start, from every instance at
+once: concurrent migrators wait for each other and each file runs exactly
+once.
 
-const db = new Database("app.db");
-try {
-  db.loadExtension("./sqlite_vec");
-  await migrate(db, "migrations");
-} finally {
-  db.close();
-}
-```
-
-This is a narrow workaround for the current `Bun.SQL` SQLite adapter, which
-does not expose extension loading yet. Track upstream Bun issue
-[#22063](https://github.com/oven-sh/bun/issues/22063) for the native fix.
-
-### Options
-
-| Option   | Default                | Description                          |
-| -------- | ---------------------- | ------------------------------------ |
-| `table`  | `ratchet_migrations` | Name of the metadata table to track. |
-
-### Behavior
-
-- **Forward-only.** No down/rollback support, by design.
-- **Lexicographic order.** The file with the smallest name runs first.
-- **Drift detection.** Each file's contents are SHA-256 hashed; editing an
-  applied file is rejected.
-- **Out-of-order detection.** A pending file that sorts before any applied
-  file is rejected so you can rename it instead of silently skipping it.
-- **No-op migrations.** Blank `.sql` files are valid and are still recorded.
-- **No hidden DDL.** The metadata table is created by a real, visible first
-  migration (`0000_ratchet.sql`) that you can read and edit like any other.
-
-### Errors
-
-Ratchet's validation and setup errors are `RatchetError`. Database read and
-execution errors from `Bun.SQL` are allowed to bubble with their original error
-type so callers can inspect adapter-specific details:
-
-```ts
-import { SQL } from "bun";
-import { RatchetError, migrate } from "ratchet";
-
-try {
-  await migrate(sql, "migrations");
-} catch (error) {
-  if (error instanceof RatchetError) {
-    console.error(error.message);
-    return;
-  }
-  if (error instanceof SQL.SQLError) {
-    console.error("database error:", error.message);
-    return;
-  }
-  throw error;
-}
-```
-
-### Programmatic status
+### Status
 
 ```ts
 import { getMigrationStatus } from "ratchet";
 
 const status = await getMigrationStatus(sql, "migrations");
-if (status.pending.length > 0) {
-  console.log(`pending: ${status.pending.map((f) => f.name).join(", ")}`);
+```
+
+| Field        | Type                                    | Meaning                                        |
+| ------------ | --------------------------------------- | ---------------------------------------------- |
+| `files`      | `{ name, path, checksum }[]`            | Every migration file, in run order.            |
+| `records`    | `{ name, checksum, appliedAt: Date }[]` | Every row in the metadata table.               |
+| `pending`    | `{ name, path, checksum }[]`            | Files not applied yet.                         |
+| `changed`    | `{ name, expected, actual }[]`          | Applied files whose contents changed.          |
+| `missing`    | `{ name, checksum, appliedAt: Date }[]` | Applied records whose file is gone.            |
+| `outOfOrder` | `{ name, path, checksum }[]`            | Pending files that sort before an applied one. |
+
+`getMigrationStatus` is read-only. It never creates the metadata table; a
+database that has never been migrated reports every file as pending.
+
+### Errors
+
+Every error ratchet raises itself is a `RatchetError`. When a migration file
+fails to execute, you get a `MigrationError` (a subclass) that tells you which
+file failed and which files were committed before it. The database error is
+kept as `cause`:
+
+```ts
+import { SQL } from "bun";
+import { MigrationError, RatchetError, migrate } from "ratchet";
+
+try {
+  await migrate(sql, "migrations");
+} catch (error) {
+  if (error instanceof MigrationError) {
+    console.error(`${error.migration} failed; applied before it: ${error.applied.join(", ")}`);
+    console.error(error.cause); // the original SQL.SQLError
+  } else if (error instanceof RatchetError) {
+    console.error(error.message); // validation problem, nothing was run
+  }
+  throw error;
 }
 ```
+
+Connection errors and the like are not wrapped and bubble up unchanged.
+
+## Migration files
+
+- Files live directly in the migrations directory and are named
+  `<version>_<name>.sql`, e.g. `0001_add_users.sql`. Any other `.sql` file
+  there is an error. Other file types and subdirectories are ignored.
+- Files run in numeric version order (`9_x.sql` before `10_y.sql`). Two files
+  with the same version (`0003_a.sql` and `0003_b.sql`, a classic merge
+  result) are an error.
+- A file may contain any number of statements. Blank and comment-only files
+  are valid no-ops and are still recorded.
+- Do not put `BEGIN`/`COMMIT` in a file; ratchet wraps each file in its own
+  transaction.
+
+## Guarantees
+
+Before running anything, ratchet checks the whole directory against the
+database and refuses to proceed if:
+
+- an applied file was **changed** (SHA-256 checksum mismatch; line endings and
+  a UTF-8 BOM are normalized first, so a git `autocrlf` checkout is not a
+  change),
+- an applied file is **missing**,
+- a pending file sorts **before** an already-applied one.
+
+Then each pending file runs in its own transaction together with the insert
+that records it. If a file fails, that transaction rolls back, nothing after
+it runs, and every earlier file stays committed. Fix the file and run again.
+
+Concurrent migrators are serialized:
+
+- **PostgreSQL**: session-level `pg_advisory_lock` on a reserved connection.
+  The server drops the lock if the process dies.
+- **MySQL / MariaDB**: `GET_LOCK` on a reserved connection, with the same
+  cleanup on disconnect.
+- **SQLite**: each file runs in a `BEGIN IMMEDIATE` transaction, which re-checks
+  the metadata table, and ratchet sets `busy_timeout` for the run (if you have
+  not set one) so other processes wait instead of failing.
+
+### Engine notes
+
+- **MySQL / MariaDB commit DDL implicitly.** If a file with several DDL
+  statements fails halfway, the statements before the failure stay applied and
+  the file is not recorded. Prefer one DDL statement per migration there.
+  The `MigrationError` message points this out.
+- **PostgreSQL**: statements that cannot run in a transaction, like
+  `CREATE INDEX CONCURRENTLY`, are not supported. Behind a transaction-pooling
+  proxy such as PgBouncer, point ratchet at a direct connection, because
+  session advisory locks need a real session.
+- **SQLite**: ratchet splits files into statements with SQLite's own rules
+  (including `CREATE TRIGGER ... BEGIN ... END;`) and runs them one at a time.
+  It has to, because Bun's SQLite adapter silently ignores errors from any
+  statement after the first in a multi-statement string.
 
 ## CLI
 
 ```sh
-ratchet init                 # writes migrations/0000_ratchet.sql
 ratchet create add_users     # writes migrations/0001_add_users.sql
 ratchet up                   # applies pending migrations
-ratchet status               # prints applied / pending / changed / missing
-ratchet drop                 # wipes the database so you can re-run migrations
+ratchet status               # prints applied / pending / changed / missing / out of order
 ```
 
-`ratchet create` accepts a free-form name and slugifies it. If you don't
-pass a name, a memorable random one is generated.
+`ratchet status` exits with 1 when `up` would refuse to run (changed, missing,
+or out-of-order files). Pending files alone are not a failure.
 
 ### Configuration
 
-| Flag      | Env                      | Default                         |
-| --------- | ------------------------ | ------------------------------- |
-| `--dir`   | `RATCHET_DIR`          | `migrations`                    |
-| `--table` | `RATCHET_TABLE`        | `ratchet_migrations`          |
-| `--url`   | `RATCHET_DATABASE_URL` | Bun's auto-detected env vars    |
-| `--sqlite-extension` | `RATCHET_SQLITE_EXTENSIONS` | unset |
-| `--sqlite-library` | `RATCHET_SQLITE_LIBRARY` | unset |
+| Flag          | Env                    | Default                      |
+| ------------- | ---------------------- | ---------------------------- |
+| `-d, --dir`   | `RATCHET_DIR`          | `migrations`                 |
+| `-t, --table` | `RATCHET_TABLE`        | `ratchet_migrations`         |
+| `-u, --url`   | `RATCHET_DATABASE_URL` | Bun's auto-detected env vars |
 
-Flags override env vars. If no URL is set, ratchet calls `new SQL()` and
-lets Bun auto-detect from `DATABASE_URL`, `POSTGRES_URL`, `MYSQL_URL`, etc.
+Flags override env vars. Empty env vars count as unset. If no URL is set,
+ratchet calls `new SQL()` and lets Bun pick up `DATABASE_URL`, `POSTGRES_URL`,
+`MYSQL_URL`, and so on.
 
-`--sqlite-extension` may be passed more than once. The env var form accepts a
-comma-separated list. When any SQLite extension or custom SQLite library is
-configured, `ratchet up` and `ratchet status` use `bun:sqlite` instead of
-`Bun.SQL`, so the extension is loaded on the same connection that runs the
-migrations.
+## Upgrading from 0.3
 
-```sh
-ratchet up --url sqlite://app.db --sqlite-extension ./sqlite_vec
-```
-
-On macOS, extension loading may require a Homebrew SQLite library:
-
-```sh
-ratchet up \
-  --url sqlite://app.db \
-  --sqlite-library /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib \
-  --sqlite-extension ./sqlite_vec
-```
-
-> [!IMPORTANT]
-> Use the same `--table` for `init` and `up`. The metadata table is created by
-> `0000_ratchet.sql`; if `--table` doesn't match what that file creates,
-> ratchet refuses to apply migrations and tells you which value to use.
-
-### `drop`
-
-`ratchet drop` is a development convenience that wipes the connected database
-so you can re-run every migration against a clean slate without recreating
-the database container or hand-running `DROP DATABASE`.
-
-What it actually does depends on the engine:
-
-- **PostgreSQL.** `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` and
-  best-effort restore of default grants. Anything outside `public` is
-  untouched.
-- **MySQL / MariaDB.** Drops every table and view in the database currently
-  selected by the connection, with `FOREIGN_KEY_CHECKS` disabled for the
-  duration. The database itself is preserved.
-- **SQLite.** Closes the connection and deletes the database file along with
-  any `-journal`, `-wal`, and `-shm` sidecars. `:memory:` is a no-op (closing
-  the connection already discards it).
-
-It requires you to type `drop` to confirm, or pass `--yes` to skip the
-prompt. It is disabled when `NODE_ENV=production`.
-
-After `drop`, run `ratchet up` to replay every migration from scratch.
-
-## Caveats
-
-- **Single-process migrator.** ratchet does not take an advisory lock, so
-  do not run `ratchet up` from multiple processes simultaneously against
-  the same database.
-- **Connection ownership.** `migrate(sql, ...)` does not close `sql`.
-- **Single-transaction apply.** All pending migrations run inside one
-  transaction. DDL that cannot run inside a transaction (for example
-  `CREATE INDEX CONCURRENTLY` on PostgreSQL) is not supported.
+- Existing databases keep working as they are. Records and checksums written
+  by 0.3 are accepted, and an existing `0000_ratchet.sql` stays as a harmless
+  applied migration. Keep it.
+- New projects no longer need a bootstrap file. `ratchet init` is gone; run
+  `ratchet create <name>`.
+- `ratchet drop` is gone. Reset development databases with your database's
+  own tooling.
+- `bun:sqlite` `Database` connections, `--sqlite-extension` and
+  `--sqlite-library` are gone. Pass a `Bun.SQL` instance.
+- `ratchet create` requires a name.
+- Files must be named `<version>_<name>.sql`, and duplicate versions are
+  rejected.
+- `migrate` resolves to `{ applied, alreadyApplied }`. `skipped` was renamed
+  and `directory` / `table` are no longer echoed back.
+- `getMigrationStatus` returns `{ files, records, pending, changed, missing,
+outOfOrder }`. `applied` was renamed to `records`, `tableOk`, `tableError`,
+  `directory` and `table` are gone, and each record's `applied_at` is now
+  `appliedAt`, always a `Date`.

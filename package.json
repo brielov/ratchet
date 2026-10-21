@@ -1,19 +1,20 @@
 {
   "name": "ratchet",
-  "version": "0.3.0",
-  "description": "A small Bun-only SQL migrator built on Bun.SQL, with a bun:sqlite path for SQLite extensions.",
+  "version": "0.4.0",
+  "description": "A small, strict, forward-only SQL migrator for Bun.SQL (PostgreSQL, MySQL, MariaDB, SQLite).",
   "keywords": [
     "bun",
     "bun.sql",
+    "mariadb",
     "migrate",
     "migration",
     "migrations",
-    "sql",
+    "mysql",
     "postgres",
     "postgresql",
-    "mysql",
-    "sqlite",
-    "schema"
+    "schema",
+    "sql",
+    "sqlite"
   ],
   "homepage": "https://github.com/brielov/ratchet#readme",
   "bugs": "https://github.com/brielov/ratchet/issues",
@@ -23,7 +24,19 @@
     "type": "git",
     "url": "git+https://github.com/brielov/ratchet.git"
   },
+  "bin": {
+    "ratchet": "./src/cli.ts"
+  },
+  "files": [
+    "src/index.ts",
+    "src/migrator.ts",
+    "src/statements.ts",
+    "src/cli.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
+  "sideEffects": false,
   "module": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
@@ -31,20 +44,6 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     }
-  },
-  "bin": {
-    "ratchet": "./src/cli.ts"
-  },
-  "files": [
-    "src/index.ts",
-    "src/migrator.ts",
-    "src/cli.ts",
-    "README.md",
-    "LICENSE"
-  ],
-  "sideEffects": false,
-  "engines": {
-    "bun": ">=1.2.0"
   },
   "scripts": {
     "test": "bun test",
@@ -65,5 +64,8 @@
     "typescript": {
       "optional": true
     }
+  },
+  "engines": {
+    "bun": ">=1.4.0"
   }
 }

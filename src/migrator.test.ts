@@ -1,20 +1,93 @@
 import { SQL } from "bun";
-import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
-import { main, parseCliConfig } from "./cli.ts";
+import { join } from "node:path";
 import {
   createMigrationFile,
   getMigrationStatus,
-  initMigrationDirectory,
   migrate,
+  MigrationError,
+  normalizeTable,
   RatchetError,
   slugifyMigrationName,
 } from "./migrator.ts";
 
+// SQLite always runs. The others run when a URL to a disposable database is
+// provided; every table in it is dropped before each test.
+//   RATCHET_TEST_POSTGRES_URL=postgres://postgres:ratchet@127.0.0.1:54329/ratchet
+//   RATCHET_TEST_MYSQL_URL=mysql://root:ratchet@127.0.0.1:53306/ratchet?sslmode=require
+//   RATCHET_TEST_MARIADB_URL=mysql://root:ratchet@127.0.0.1:53307/ratchet
+
+type Target = {
+  name: string;
+  dialect: "sqlite" | "postgres" | "mysql";
+  url: () => string;
+  reset: () => Promise<void>;
+  sleep: string;
+};
+
 const tempDirectories: string[] = [];
+let sqliteUrl = "";
+
+const targets: Target[] = [
+  {
+    name: "sqlite",
+    dialect: "sqlite",
+    url: () => sqliteUrl,
+    reset: async () => {
+      sqliteUrl = `sqlite://${join(await tempDirectory(), "app.db")}`;
+    },
+    sleep:
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300000) SELECT COUNT(*) FROM n;",
+  },
+];
+
+const postgresUrl = Bun.env.RATCHET_TEST_POSTGRES_URL;
+if (postgresUrl) {
+  targets.push({
+    name: "postgres",
+    dialect: "postgres",
+    url: () => postgresUrl,
+    reset: () =>
+      withSql(postgresUrl, (sql) =>
+        sql.unsafe("DROP SCHEMA public CASCADE; CREATE SCHEMA public;").simple(),
+      ),
+    sleep: "SELECT pg_sleep(0.2);",
+  });
+}
+
+for (const [name, url] of [
+  ["mysql", Bun.env.RATCHET_TEST_MYSQL_URL],
+  ["mariadb", Bun.env.RATCHET_TEST_MARIADB_URL],
+] as const) {
+  if (!url) {
+    continue;
+  }
+
+  targets.push({
+    name,
+    dialect: "mysql",
+    url: () => url,
+    reset: () =>
+      withSql(url, async (sql) => {
+        const reserved = await sql.reserve();
+        try {
+          const tables = await reserved<{ name: string }[]>`
+            SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE()
+          `;
+          await reserved`SET FOREIGN_KEY_CHECKS = 0`;
+          for (const table of tables) {
+            await reserved`DROP TABLE ${reserved(table.name)}`;
+          }
+          await reserved`SET FOREIGN_KEY_CHECKS = 1`;
+        } finally {
+          reserved.release();
+        }
+      }),
+    sleep: "SELECT SLEEP(0.2);",
+  });
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -22,522 +95,471 @@ afterEach(async () => {
   );
 });
 
-test("init writes the metadata migration", async () => {
-  const directory = await tempDirectory();
-  const result = await initMigrationDirectory(directory);
+for (const target of targets) {
+  describe(target.name, () => {
+    let sql: SQL;
+    let directory: string;
 
-  expect(basename(result.path)).toBe("0000_ratchet.sql");
-  expect(await Bun.file(result.path).text()).toContain(
-    "CREATE TABLE IF NOT EXISTS ratchet_migrations",
-  );
-});
+    beforeEach(async () => {
+      await target.reset();
+      sql = new SQL(target.url());
+      directory = await tempDirectory();
+    });
 
-test("init rejects mixed-case metadata table names", async () => {
-  const directory = await tempDirectory();
+    afterEach(async () => {
+      await sql.close();
+    });
 
-  await expectRejectsWith(initMigrationDirectory(directory, "Foo"), [
-    "simple unquoted SQL identifier",
-    "lowercase letters",
-  ]);
-});
+    test("applies pending migrations in version order and skips them on rerun", async () => {
+      await writeMigrations(directory, {
+        "10_second.sql": "INSERT INTO widgets (id) VALUES (2);",
+        "9_first.sql":
+          "CREATE TABLE widgets (id INT PRIMARY KEY);\nINSERT INTO widgets (id) VALUES (1);",
+      });
 
-test("init explains when the migration directory is already initialized", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
+      const first = await migrate(sql, directory);
+      expect(first.applied).toEqual(["9_first.sql", "10_second.sql"]);
+      expect(first.alreadyApplied).toEqual([]);
 
-  await expectRejectsWith(initMigrationDirectory(directory), [
-    "already initialized",
-    "ratchet create <name>",
-  ]);
-});
+      const second = await migrate(sql, directory);
+      expect(second.applied).toEqual([]);
+      expect(second.alreadyApplied).toEqual(["9_first.sql", "10_second.sql"]);
 
-test("create writes the next numbered migration", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
+      expect(await ids(sql, "widgets")).toEqual([1, 2]);
+      expect(await recordNames(sql)).toEqual(["10_second.sql", "9_first.sql"]);
+    });
 
-  const named = await createMigrationFile(directory, "Add Users");
-  const generated = await createMigrationFile(directory);
+    test("creates the metadata table under a custom name", async () => {
+      await writeMigrations(directory, { "0001_init.sql": "CREATE TABLE widgets (id INT);" });
 
-  expect(named.name).toBe("0001_add_users.sql");
-  expect(generated.name).toMatch(/^0002_[a-z]+_[a-z]+_[a-z]+\.sql$/);
-});
+      const result = await migrate(sql, directory, { table: "schema_history" });
 
-test("create avoids repeated random migration names", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(join(directory, "0001_able_building_anchor.sql"), "");
+      expect(result.applied).toEqual(["0001_init.sql"]);
+      expect(await recordNames(sql, "schema_history")).toEqual(["0001_init.sql"]);
+    });
 
-  const generated = await withRandomValues([0, 0, 0, 0.1, 0, 0], () =>
-    createMigrationFile(directory),
-  );
+    test("records blank and comment-only files as no-op migrations", async () => {
+      await writeMigrations(directory, {
+        "0001_blank.sql": "",
+        "0002_whitespace.sql": "  \n\n",
+        "0003_comments.sql": "-- nothing to do yet\n/* still nothing */\n",
+      });
 
-  expect(generated.name).toBe("0002_brave_building_anchor.sql");
-});
+      const result = await migrate(sql, directory);
 
-test("migrate applies pending sql files and skips them on rerun", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(
-    join(directory, "0001_create_widgets.sql"),
-    "CREATE TABLE widgets (name TEXT NOT NULL); INSERT INTO widgets (name) VALUES ('Ada');",
-  );
+      expect(result.applied).toEqual([
+        "0001_blank.sql",
+        "0002_whitespace.sql",
+        "0003_comments.sql",
+      ]);
+    });
 
-  const sql = new SQL(":memory:");
-  try {
-    const first = await migrate(sql, directory);
-    const second = await migrate(sql, directory);
-    const rows = await sql<{ name: string }[]>`SELECT name FROM widgets`;
+    test("rolls back a failing migration, keeps earlier ones, and reports which file failed", async () => {
+      await writeMigrations(directory, {
+        "0001_table.sql": "CREATE TABLE widgets (id INT PRIMARY KEY);",
+        // The failure is in a later statement and only detectable at runtime.
+        "0002_dupe.sql":
+          "INSERT INTO widgets (id) VALUES (10);\nINSERT INTO widgets (id) VALUES (10);\nINSERT INTO widgets (id) VALUES (11);",
+        "0003_never.sql": "INSERT INTO widgets (id) VALUES (30);",
+      });
 
-    expect(first.applied).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
-    expect(second.applied).toEqual([]);
-    expect(second.skipped).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
-    expect(rows).toEqual([{ name: "Ada" }]);
-  } finally {
-    await sql.close();
-  }
-});
+      const error = await migrate(sql, directory).catch((caught: unknown) => caught);
 
-test("migrate accepts bun:sqlite databases for SQLite extension use cases", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(
-    join(directory, "0001_create_widgets.sql"),
-    "CREATE TABLE widgets (name TEXT NOT NULL); INSERT INTO widgets (name) VALUES ('Ada');",
-  );
+      expect(error).toBeInstanceOf(MigrationError);
+      const failure = error as MigrationError;
+      expect(failure.migration).toBe("0002_dupe.sql");
+      expect(failure.applied).toEqual(["0001_table.sql"]);
+      expect(failure.message).toContain("0002_dupe.sql");
+      expect(failure.cause).toBeInstanceOf(SQL.SQLError);
+      expect(await ids(sql, "widgets")).toEqual([]);
+      expect(await recordNames(sql)).toEqual(["0001_table.sql"]);
 
-  const db = new Database(":memory:");
-  try {
-    const first = await migrate(db, directory);
-    const second = await migrate(db, directory);
-    const rows = db.query("SELECT name FROM widgets").all();
-    const status = await getMigrationStatus(db, directory);
+      // The failed file was never recorded, so it can be fixed and retried.
+      await Bun.write(join(directory, "0002_dupe.sql"), "INSERT INTO widgets (id) VALUES (10);");
+      const retry = await migrate(sql, directory);
+      expect(retry.applied).toEqual(["0002_dupe.sql", "0003_never.sql"]);
+      expect(await ids(sql, "widgets")).toEqual([10, 30]);
+    });
 
-    expect(first.applied).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
-    expect(second.applied).toEqual([]);
-    expect(rows).toEqual([{ name: "Ada" }]);
-    expect(status.tableOk).toBe(true);
-    expect(status.pending).toEqual([]);
-  } finally {
-    db.close();
-  }
-});
-
-test("migrate records blank sql files as no-op migrations", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  const blank = await createMigrationFile(directory, "empty");
-
-  const sql = new SQL(":memory:");
-  try {
-    const result = await migrate(sql, directory);
-
-    expect(result.applied).toEqual(["0000_ratchet.sql", blank.name]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate fails when an applied file changes", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  const migration = join(directory, "0001_create_widgets.sql");
-  await Bun.write(migration, "CREATE TABLE widgets (name TEXT NOT NULL);");
-
-  const sql = new SQL(":memory:");
-  try {
-    await migrate(sql, directory);
-    await Bun.write(migration, "CREATE TABLE widgets (name TEXT NOT NULL, id INTEGER);");
-
-    await expectRejectsWith(migrate(sql, directory), [
-      "migration checksum mismatch",
-      "Applied migration files are immutable",
-      "create a new migration",
-    ]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate fails when an applied migration file is missing", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  const migration = await createMigrationFile(directory, "empty");
-
-  const sql = new SQL(":memory:");
-  try {
-    await migrate(sql, directory);
-    await rm(migration.path);
-    await Bun.write(
-      join(directory, "0002_create_widgets.sql"),
-      "CREATE TABLE widgets (name TEXT NOT NULL);",
-    );
-
-    await expectRejectsWith(migrate(sql, directory), [
-      "applied migration file missing",
-      "Restore the missing file(s)",
-      "recreate it",
-    ]);
-    expect(await tableExists(sql, "widgets")).toBe(false);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate rejects pending files that sort before applied migrations", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(
-    join(directory, "0002_create_later_widgets.sql"),
-    "CREATE TABLE later_widgets (name TEXT NOT NULL);",
-  );
-
-  const sql = new SQL(":memory:");
-  try {
-    await migrate(sql, directory);
-    await Bun.write(
-      join(directory, "0001_create_earlier_widgets.sql"),
-      "CREATE TABLE earlier_widgets (name TEXT NOT NULL);",
-    );
-
-    await expectRejectsWith(migrate(sql, directory), [
-      "pending migration sorts before applied",
-      "lexicographic order",
-      "rename the pending file(s)",
-    ]);
-    expect(await tableExists(sql, "earlier_widgets")).toBe(false);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate fails with an init hint when the metadata migration is missing", async () => {
-  const directory = await tempDirectory();
-  await Bun.write(join(directory, "0001_do_work.sql"), "SELECT 1;");
-
-  const sql = new SQL(":memory:");
-  try {
-    await expectRejectsWith(migrate(sql, directory), [
-      "ratchet init",
-      "0000_ratchet.sql",
-      "--dir, --table, and --url",
-    ]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate explains how to create or select a missing migration directory", async () => {
-  const directory = join(await tempDirectory(), "missing");
-
-  const sql = new SQL(":memory:");
-  try {
-    await expectRejectsWith(migrate(sql, directory), [
-      "migration directory not found",
-      "ratchet init --dir",
-      "contains your *.sql migrations",
-    ]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate rejects a --table that does not match the bootstrap migration", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory, "first_table");
-
-  const sql = new SQL(":memory:");
-  try {
-    await expectRejectsWith(migrate(sql, directory, { table: "second_table" }), [
-      "bootstrap migration 0000_ratchet.sql",
-      'creates table "first_table"',
-      'configured table is "second_table"',
-      "Pass --table first_table",
-    ]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate does not bootstrap when an existing metadata table is unreadable", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(
-    join(directory, "0001_create_widgets.sql"),
-    "CREATE TABLE widgets (name TEXT NOT NULL);",
-  );
-
-  const sql = new SQL(":memory:");
-  try {
-    await sql`CREATE TABLE ratchet_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL)`;
-
-    await expectRejectsWith(migrate(sql, directory), [
-      "could not read migration table",
-      "only bootstraps when the metadata table is missing",
-      "applied_at",
-    ]);
-    expect(await tableExists(sql, "widgets")).toBe(false);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("migrate lets database execution errors bubble", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-  await Bun.write(join(directory, "0001_broken.sql"), "CREATE TABLE broken (");
-
-  const sql = new SQL(":memory:");
-  try {
-    try {
+    test("rejects a changed applied migration before running anything", async () => {
+      await writeMigrations(directory, { "0001_table.sql": "CREATE TABLE widgets (id INT);" });
       await migrate(sql, directory);
-    } catch (error) {
-      expect(error).toBeInstanceOf(Error);
-      expect(error).not.toBeInstanceOf(RatchetError);
-      expect(error instanceof Error ? error.message : String(error)).toContain("incomplete input");
-      return;
+
+      await writeMigrations(directory, {
+        "0001_table.sql": "CREATE TABLE widgets (id INT, name TEXT);",
+        "0002_insert.sql": "INSERT INTO widgets (id) VALUES (1);",
+      });
+
+      await expectRatchetError(migrate(sql, directory), ["checksum mismatch", "0001_table.sql"]);
+      expect(await ids(sql, "widgets")).toEqual([]);
+    });
+
+    test("treats CRLF line endings and a BOM as the same migration", async () => {
+      await writeMigrations(directory, {
+        "0001_table.sql": "CREATE TABLE widgets (id INT);\nINSERT INTO widgets (id) VALUES (1);\n",
+      });
+      await migrate(sql, directory);
+
+      await writeMigrations(directory, {
+        "0001_table.sql":
+          "﻿CREATE TABLE widgets (id INT);\r\nINSERT INTO widgets (id) VALUES (1);\r\n",
+      });
+
+      const result = await migrate(sql, directory);
+      expect(result.alreadyApplied).toEqual(["0001_table.sql"]);
+    });
+
+    test("accepts checksums recorded by ratchet 0.3 over raw file bytes", async () => {
+      const raw = "CREATE TABLE widgets (id INT);\r\n";
+      await writeMigrations(directory, {
+        "0000_ratchet.sql": `CREATE TABLE IF NOT EXISTS ratchet_migrations (
+  name VARCHAR(255) PRIMARY KEY,
+  checksum VARCHAR(64) NOT NULL,
+  applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`,
+        "0001_table.sql": raw,
+      });
+
+      // Simulate a database migrated by 0.3: its bootstrap file created the
+      // table and checksums were taken over the bytes on disk.
+      await sql.unsafe(await Bun.file(join(directory, "0000_ratchet.sql")).text());
+      await sql.unsafe("CREATE TABLE widgets (id INT)");
+      for (const name of ["0000_ratchet.sql", "0001_table.sql"]) {
+        const checksum = new Bun.CryptoHasher("sha256")
+          .update(await Bun.file(join(directory, name)).text())
+          .digest("hex");
+        await sql`INSERT INTO ratchet_migrations (name, checksum) VALUES (${name}, ${checksum})`;
+      }
+
+      await writeMigrations(directory, {
+        "0002_insert.sql": "INSERT INTO widgets (id) VALUES (1);",
+      });
+      const result = await migrate(sql, directory);
+
+      expect(result.alreadyApplied).toEqual(["0000_ratchet.sql", "0001_table.sql"]);
+      expect(result.applied).toEqual(["0002_insert.sql"]);
+    });
+
+    test("runs a legacy 0000_ratchet.sql bootstrap file on a fresh database", async () => {
+      await writeMigrations(directory, {
+        "0000_ratchet.sql":
+          "CREATE TABLE IF NOT EXISTS ratchet_migrations (\n  name VARCHAR(255) PRIMARY KEY,\n  checksum VARCHAR(64) NOT NULL,\n  applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\n);\n",
+        "0001_table.sql": "CREATE TABLE widgets (id INT);",
+      });
+
+      const result = await migrate(sql, directory);
+      expect(result.applied).toEqual(["0000_ratchet.sql", "0001_table.sql"]);
+    });
+
+    test("rejects an applied migration whose file is missing", async () => {
+      await writeMigrations(directory, {
+        "0001_table.sql": "CREATE TABLE widgets (id INT);",
+        "0002_insert.sql": "INSERT INTO widgets (id) VALUES (1);",
+      });
+      await migrate(sql, directory);
+      await rm(join(directory, "0001_table.sql"));
+
+      await expectRatchetError(migrate(sql, directory), ["file missing", "0001_table.sql"]);
+    });
+
+    test("rejects a pending migration that sorts before an applied one", async () => {
+      await writeMigrations(directory, { "0002_table.sql": "CREATE TABLE widgets (id INT);" });
+      await migrate(sql, directory);
+      await writeMigrations(directory, { "0001_late.sql": "CREATE TABLE late (id INT);" });
+
+      await expectRatchetError(migrate(sql, directory), [
+        "sorts before applied migration 0002_table.sql",
+        "0001_late.sql",
+      ]);
+    });
+
+    test("serializes concurrent migrators so each file runs exactly once", async () => {
+      const files: Record<string, string> = {
+        "0001_table.sql": `CREATE TABLE hits (name VARCHAR(50) NOT NULL);\n${target.sleep}`,
+      };
+      for (let index = 2; index <= 8; index += 1) {
+        const name = `000${index}_hit.sql`;
+        files[name] = `INSERT INTO hits (name) VALUES ('${name}');`;
+      }
+      await writeMigrations(directory, files);
+
+      const others = [new SQL(target.url()), new SQL(target.url()), new SQL(target.url())];
+      try {
+        const results = await Promise.all(
+          [sql, ...others].map((connection) => migrate(connection, directory)),
+        );
+
+        const applied = results.flatMap((result) => result.applied).sort();
+        expect(applied).toEqual(Object.keys(files).sort());
+        for (const result of results) {
+          expect([...result.applied, ...result.alreadyApplied].sort()).toEqual(
+            Object.keys(files).sort(),
+          );
+        }
+
+        const hits = await sql<{ count: number }[]>`SELECT COUNT(*) AS count FROM hits`;
+        expect(Number(hits[0]?.count)).toBe(7);
+      } finally {
+        await Promise.all(others.map((connection) => connection.close()));
+      }
+    });
+
+    test("status is read-only and reports every problem migrate would refuse", async () => {
+      await writeMigrations(directory, {
+        "0002_table.sql": "CREATE TABLE widgets (id INT);",
+        "0003_changed.sql": "SELECT 1;",
+        "0004_gone.sql": "SELECT 1;",
+      });
+
+      const fresh = await getMigrationStatus(sql, directory);
+      expect(fresh.records).toEqual([]);
+      expect(fresh.pending.map((file) => file.name)).toEqual([
+        "0002_table.sql",
+        "0003_changed.sql",
+        "0004_gone.sql",
+      ]);
+      // Bun's expect().rejects never executes a lazy SQL query, so await it directly.
+      const read = await sql`SELECT name FROM ratchet_migrations`.then(
+        () => "read",
+        () => "missing",
+      );
+      expect(read).toBe("missing");
+
+      await migrate(sql, directory);
+      await writeMigrations(directory, {
+        "0001_late.sql": "SELECT 1;",
+        "0003_changed.sql": "SELECT 2;",
+        "0005_next.sql": "SELECT 1;",
+      });
+      await rm(join(directory, "0004_gone.sql"));
+
+      const status = await getMigrationStatus(sql, directory);
+      expect(status.records.map((record) => record.name)).toEqual([
+        "0002_table.sql",
+        "0003_changed.sql",
+        "0004_gone.sql",
+      ]);
+      expect(status.pending.map((file) => file.name)).toEqual(["0001_late.sql", "0005_next.sql"]);
+      expect(status.outOfOrder.map((file) => file.name)).toEqual(["0001_late.sql"]);
+      expect(status.changed.map((change) => change.name)).toEqual(["0003_changed.sql"]);
+      expect(status.missing.map((record) => record.name)).toEqual(["0004_gone.sql"]);
+      expect(Object.keys(status.pending[0]!).sort()).toEqual(["checksum", "name", "path"]);
+      for (const record of status.records) {
+        expect(Object.keys(record).sort()).toEqual(["appliedAt", "checksum", "name"]);
+        expect(record.appliedAt).toBeInstanceOf(Date);
+        expect(Math.abs(record.appliedAt.getTime() - Date.now())).toBeLessThan(60 * 60 * 1000);
+      }
+    });
+
+    if (target.dialect === "sqlite") {
+      test("serializes migrators running in separate processes", async () => {
+        const files: Record<string, string> = {
+          "0001_table.sql": `CREATE TABLE hits (name VARCHAR(50) NOT NULL);\n${target.sleep}`,
+        };
+        for (let index = 2; index <= 8; index += 1) {
+          const name = `000${index}_hit.sql`;
+          files[name] = `INSERT INTO hits (name) VALUES ('${name}');`;
+        }
+        await writeMigrations(directory, files);
+
+        const script = `
+          import { SQL } from "bun";
+          import { migrate } from ${JSON.stringify(join(import.meta.dir, "migrator.ts"))};
+          const sql = new SQL(${JSON.stringify(target.url())});
+          const result = await migrate(sql, ${JSON.stringify(directory)});
+          await sql.close();
+          console.log(JSON.stringify(result.applied));
+        `;
+        const children = Array.from({ length: 4 }, () =>
+          Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" }),
+        );
+        const outputs = await Promise.all(
+          children.map(async (child) => ({
+            code: await child.exited,
+            stdout: await new Response(child.stdout).text(),
+            stderr: await new Response(child.stderr).text(),
+          })),
+        );
+
+        for (const output of outputs) {
+          expect(output.stderr).toBe("");
+          expect(output.code).toBe(0);
+        }
+        const applied = outputs.flatMap((output) => JSON.parse(output.stdout) as string[]).sort();
+        expect(applied).toEqual(Object.keys(files).sort());
+
+        const hits = await sql<{ count: number }[]>`SELECT COUNT(*) AS count FROM hits`;
+        expect(Number(hits[0]?.count)).toBe(7);
+      });
+
+      test("runs trigger bodies containing semicolons", async () => {
+        await writeMigrations(directory, {
+          "0001_trigger.sql": `CREATE TABLE widgets (id INT PRIMARY KEY);
+CREATE TABLE audit (id INT);
+CREATE TRIGGER widgets_audit AFTER INSERT ON widgets
+BEGIN
+  INSERT INTO audit (id) VALUES (new.id);
+  INSERT INTO audit (id) VALUES (new.id + 100);
+END;
+INSERT INTO widgets (id) VALUES (1);`,
+        });
+
+        await migrate(sql, directory);
+        expect(await ids(sql, "audit")).toEqual([1, 101]);
+      });
     }
 
-    throw new Error("expected migration to fail");
-  } finally {
-    await sql.close();
-  }
+    if (target.dialect === "postgres") {
+      test("passes dollar-quoted function bodies through untouched", async () => {
+        await writeMigrations(directory, {
+          "0001_function.sql": `CREATE TABLE widgets (id INT);
+CREATE FUNCTION add_widget(n INT) RETURNS void AS $$
+BEGIN
+  INSERT INTO widgets (id) VALUES (n);
+  INSERT INTO widgets (id) VALUES (n + 100);
+END;
+$$ LANGUAGE plpgsql;
+SELECT add_widget(1);`,
+        });
+
+        await migrate(sql, directory);
+        expect(await ids(sql, "widgets")).toEqual([1, 101]);
+      });
+    }
+
+    if (target.dialect === "mysql") {
+      test("runs compound trigger bodies without DELIMITER", async () => {
+        await writeMigrations(directory, {
+          "0001_trigger.sql": `CREATE TABLE widgets (id INT PRIMARY KEY);
+CREATE TABLE audit (id INT);
+CREATE TRIGGER widgets_audit AFTER INSERT ON widgets FOR EACH ROW
+BEGIN
+  INSERT INTO audit (id) VALUES (NEW.id);
+  INSERT INTO audit (id) VALUES (NEW.id + 100);
+END;
+INSERT INTO widgets (id) VALUES (1);`,
+        });
+
+        await migrate(sql, directory);
+        expect(await ids(sql, "audit")).toEqual([1, 101]);
+      });
+
+      test("mentions implicit DDL commits when a MySQL migration fails", async () => {
+        await writeMigrations(directory, {
+          "0001_bad.sql": "CREATE TABLE widgets (id INT);\nSELECT * FROM nope;",
+        });
+
+        await expectRatchetError(migrate(sql, directory), ["0001_bad.sql", "implicitly"]);
+      });
+    }
+  });
+}
+
+describe("migration files", () => {
+  test("rejects .sql files without a version prefix", async () => {
+    const directory = await tempDirectory();
+    await writeMigrations(directory, { "0001_ok.sql": "", "seed.sql": "" });
+
+    await withSql("sqlite://:memory:", (sql) =>
+      expectRatchetError(migrate(sql, directory), ["invalid migration file name: seed.sql"]),
+    );
+  });
+
+  test("rejects duplicate versions", async () => {
+    const directory = await tempDirectory();
+    await writeMigrations(directory, {
+      "0001_a.sql": "",
+      "0002_b.sql": "",
+      "002_c.sql": "",
+      "0003_d.sql": "",
+    });
+
+    await withSql("sqlite://:memory:", (sql) =>
+      expectRatchetError(migrate(sql, directory), [
+        "duplicate migration version: 0002_b.sql, 002_c.sql",
+      ]),
+    );
+  });
+
+  test("ignores non-sql files and subdirectories", async () => {
+    const directory = await tempDirectory();
+    await writeMigrations(directory, {
+      "0001_a.sql": "",
+      "README.md": "",
+      "nested/0002_b.sql": "",
+    });
+
+    const result = await withSql("sqlite://:memory:", (sql) => migrate(sql, directory));
+    expect(result.applied).toEqual(["0001_a.sql"]);
+  });
+
+  test("explains a missing migration directory", async () => {
+    const directory = join(await tempDirectory(), "missing");
+
+    await withSql("sqlite://:memory:", (sql) =>
+      expectRatchetError(migrate(sql, directory), [
+        "migration directory not found",
+        "ratchet create <name>",
+      ]),
+    );
+  });
+
+  test("rejects invalid metadata table names", () => {
+    expect(() => normalizeTable("Foo")).toThrow(RatchetError);
+    expect(() => normalizeTable("public.migrations")).toThrow(RatchetError);
+    expect(normalizeTable("schema_history")).toBe("schema_history");
+  });
 });
 
-test("public package surface re-exports RatchetError and getMigrationStatus", async () => {
-  const surface = await import("./index.ts");
+describe("createMigrationFile", () => {
+  test("numbers after the highest existing version", async () => {
+    const directory = join(await tempDirectory(), "migrations");
 
-  expect(typeof surface.migrate).toBe("function");
-  expect(typeof surface.getMigrationStatus).toBe("function");
-  expect(typeof surface.RatchetError).toBe("function");
-  expect(new surface.RatchetError("x")).toBeInstanceOf(Error);
+    const first = await createMigrationFile(directory, "Add Users");
+    await writeMigrations(directory, { "0041_manual.sql": "" });
+    const next = await createMigrationFile(directory, "add posts");
+
+    expect(first.name).toBe("0001_add_users.sql");
+    expect(next.name).toBe("0042_add_posts.sql");
+    expect(await Bun.file(next.path).text()).toBe("");
+  });
+
+  test("rejects names with nothing usable in them", async () => {
+    const directory = await tempDirectory();
+
+    await expectRatchetError(createMigrationFile(directory, "!!!"), ["invalid migration name"]);
+  });
+
+  test("slugifies names", () => {
+    expect(slugifyMigrationName("  Add users' emails!  ")).toBe("add_users_emails");
+  });
 });
 
-test("status is read-only when the table is missing", async () => {
-  const directory = await tempDirectory();
-  await initMigrationDirectory(directory);
-
-  const sql = new SQL(":memory:");
-  try {
-    const status = await getMigrationStatus(sql, directory);
-
-    expect(status.tableOk).toBe(false);
-    expect(status.pending.map((file) => file.name)).toEqual(["0000_ratchet.sql"]);
-  } finally {
-    await sql.close();
-  }
-});
-
-test("cli status fails when an applied migration file is missing", async () => {
-  const directory = await tempDirectory();
-  const migrationsDirectory = join(directory, "migrations");
-  const databaseUrl = `sqlite://${join(directory, "app.db")}`;
-  await initMigrationDirectory(migrationsDirectory);
-  const migration = await createMigrationFile(migrationsDirectory, "empty");
-
-  const sql = new SQL(databaseUrl);
-  try {
-    await migrate(sql, migrationsDirectory);
-  } finally {
-    await sql.close();
-  }
-
-  await rm(migration.path);
-
-  const code = await withSilentConsole(() =>
-    main(["status", "--dir", migrationsDirectory, "--url", databaseUrl]),
+async function writeMigrations(directory: string, files: Record<string, string>): Promise<void> {
+  await Promise.all(
+    Object.entries(files).map(([name, contents]) => Bun.write(join(directory, name), contents)),
   );
+}
 
-  expect(code).toBe(1);
-});
+async function ids(sql: SQL, table: string): Promise<number[]> {
+  const rows = await sql<{ id: number }[]>`SELECT id FROM ${sql(table)} ORDER BY id`;
+  return rows.map((row) => Number(row.id));
+}
 
-test("cli drop with --yes wipes schema and lets migrations replay from scratch", async () => {
-  const directory = await tempDirectory();
-  const migrationsDirectory = join(directory, "migrations");
-  const databasePath = join(directory, "app.db");
-  const databaseUrl = `sqlite://${databasePath}`;
-  await initMigrationDirectory(migrationsDirectory);
-  await Bun.write(
-    join(migrationsDirectory, "0001_create_widgets.sql"),
-    "CREATE TABLE widgets (name TEXT NOT NULL); INSERT INTO widgets (name) VALUES ('Ada');",
-  );
+async function recordNames(sql: SQL, table = "ratchet_migrations"): Promise<string[]> {
+  const rows = await sql<{ name: string }[]>`SELECT name FROM ${sql(table)}`;
+  return rows.map((row) => row.name).sort();
+}
 
-  const sql = new SQL(databaseUrl);
+async function withSql<T>(url: string, fn: (sql: SQL) => Promise<T>): Promise<T> {
+  const sql = new SQL(url);
   try {
-    await migrate(sql, migrationsDirectory);
+    return await fn(sql);
   } finally {
     await sql.close();
   }
-
-  expect(await Bun.file(databasePath).exists()).toBe(true);
-
-  const code = await withSilentConsole(() =>
-    main(["drop", "--dir", migrationsDirectory, "--url", databaseUrl, "--yes"]),
-  );
-
-  expect(code).toBe(0);
-  expect(await Bun.file(databasePath).exists()).toBe(false);
-
-  const checkSql = new SQL(databaseUrl);
-  try {
-    expect(await tableExists(checkSql, "widgets")).toBe(false);
-    expect(await tableExists(checkSql, "ratchet_migrations")).toBe(false);
-    const replay = await migrate(checkSql, migrationsDirectory);
-    expect(replay.applied).toEqual(["0000_ratchet.sql", "0001_create_widgets.sql"]);
-    expect(await checkSql<{ name: string }[]>`SELECT name FROM widgets`).toEqual([{ name: "Ada" }]);
-  } finally {
-    await checkSql.close();
-  }
-});
-
-test("cli drop accepts typed confirmation", async () => {
-  const directory = await tempDirectory();
-  const migrationsDirectory = join(directory, "migrations");
-  const databasePath = join(directory, "app.db");
-  const databaseUrl = `sqlite://${databasePath}`;
-  await initMigrationDirectory(migrationsDirectory);
-
-  const sql = new SQL(databaseUrl);
-  try {
-    await migrate(sql, migrationsDirectory);
-  } finally {
-    await sql.close();
-  }
-
-  const code = await withPrompt(["drop"], () =>
-    withSilentConsole(() => main(["drop", "--url", databaseUrl])),
-  );
-
-  expect(code).toBe(0);
-  expect(await Bun.file(databasePath).exists()).toBe(false);
-});
-
-test("cli drop cancels when confirmation does not match", async () => {
-  const directory = await tempDirectory();
-  const migrationsDirectory = join(directory, "migrations");
-  const databasePath = join(directory, "app.db");
-  const databaseUrl = `sqlite://${databasePath}`;
-  await initMigrationDirectory(migrationsDirectory);
-
-  const sql = new SQL(databaseUrl);
-  try {
-    await migrate(sql, migrationsDirectory);
-  } finally {
-    await sql.close();
-  }
-
-  const code = await withPrompt(["nope"], () =>
-    withSilentConsole(() => main(["drop", "--url", databaseUrl])),
-  );
-
-  expect(code).toBe(1);
-  expect(await Bun.file(databasePath).exists()).toBe(true);
-
-  const checkSql = new SQL(databaseUrl);
-  try {
-    expect(await migrationNames(checkSql)).toEqual(["0000_ratchet.sql"]);
-  } finally {
-    await checkSql.close();
-  }
-});
-
-test("cli drop is disabled in production", async () => {
-  const oldNodeEnv = Bun.env.NODE_ENV;
-
-  try {
-    Bun.env.NODE_ENV = "production";
-
-    await expectRejectsWith(main(["drop", "--url", "sqlite://ignored.db", "--yes"]), [
-      "disabled",
-      "NODE_ENV=production",
-      "development database",
-    ]);
-  } finally {
-    restoreEnv("NODE_ENV", oldNodeEnv);
-  }
-});
-
-test("cli flags override Bun.env defaults", () => {
-  const oldDirectory = Bun.env.RATCHET_DIR;
-  const oldTable = Bun.env.RATCHET_TABLE;
-  const oldUrl = Bun.env.RATCHET_DATABASE_URL;
-  const oldSqliteExtensions = Bun.env.RATCHET_SQLITE_EXTENSIONS;
-  const oldSqliteLibrary = Bun.env.RATCHET_SQLITE_LIBRARY;
-
-  try {
-    Bun.env.RATCHET_DIR = "env_migrations";
-    Bun.env.RATCHET_TABLE = "env_table";
-    Bun.env.RATCHET_DATABASE_URL = "sqlite://env.db";
-    Bun.env.RATCHET_SQLITE_EXTENSIONS = "env_one,env_two";
-    Bun.env.RATCHET_SQLITE_LIBRARY = "env_sqlite";
-
-    const config = parseCliConfig([
-      "up",
-      "--dir",
-      "flag_migrations",
-      "--table",
-      "flag_table",
-      "--url",
-      "sqlite://flag.db",
-      "--sqlite-extension",
-      "flag_one",
-      "--sqlite-extension",
-      "flag_two",
-      "--sqlite-library",
-      "flag_sqlite",
-    ]);
-
-    expect(config.directory).toBe("flag_migrations");
-    expect(config.table).toBe("flag_table");
-    expect(config.url).toBe("sqlite://flag.db");
-    expect(config.sqliteExtensions).toEqual(["flag_one", "flag_two"]);
-    expect(config.sqliteLibrary).toBe("flag_sqlite");
-  } finally {
-    restoreEnv("RATCHET_DIR", oldDirectory);
-    restoreEnv("RATCHET_TABLE", oldTable);
-    restoreEnv("RATCHET_DATABASE_URL", oldUrl);
-    restoreEnv("RATCHET_SQLITE_EXTENSIONS", oldSqliteExtensions);
-    restoreEnv("RATCHET_SQLITE_LIBRARY", oldSqliteLibrary);
-  }
-});
-
-test("cli reads SQLite extension configuration from Bun.env", () => {
-  const oldSqliteExtensions = Bun.env.RATCHET_SQLITE_EXTENSIONS;
-  const oldSqliteLibrary = Bun.env.RATCHET_SQLITE_LIBRARY;
-
-  try {
-    Bun.env.RATCHET_SQLITE_EXTENSIONS = " first_ext,second_ext ,, third_ext ";
-    Bun.env.RATCHET_SQLITE_LIBRARY = "custom_sqlite";
-
-    const config = parseCliConfig(["status"]);
-
-    expect(config.sqliteExtensions).toEqual(["first_ext", "second_ext", "third_ext"]);
-    expect(config.sqliteLibrary).toBe("custom_sqlite");
-  } finally {
-    restoreEnv("RATCHET_SQLITE_EXTENSIONS", oldSqliteExtensions);
-    restoreEnv("RATCHET_SQLITE_LIBRARY", oldSqliteLibrary);
-  }
-});
-
-test("cli unknown command exits non-zero and prints help", async () => {
-  const errors: string[] = [];
-  const oldError = console.error;
-  console.error = (message: unknown) => {
-    errors.push(typeof message === "string" ? message : String(message));
-  };
-
-  try {
-    const code = await main(["wat"]);
-    expect(code).toBe(1);
-    expect(errors.join("\n")).toContain("unknown command: wat");
-    expect(errors.join("\n")).toContain("Usage:");
-  } finally {
-    console.error = oldError;
-  }
-});
-
-test("slugifies migration names", () => {
-  expect(slugifyMigrationName("Add OAuth Users!")).toBe("add_oauth_users");
-});
+}
 
 async function tempDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "ratchet-"));
@@ -545,96 +567,14 @@ async function tempDirectory(): Promise<string> {
   return directory;
 }
 
-async function withSilentConsole<T>(callback: () => Promise<T>): Promise<T> {
-  const oldLog = console.log;
-  const oldError = console.error;
+async function expectRatchetError(promise: Promise<unknown>, fragments: string[]): Promise<void> {
+  const error = await promise.then(
+    () => undefined,
+    (caught: unknown) => caught,
+  );
 
-  try {
-    console.log = () => {};
-    console.error = () => {};
-    return await callback();
-  } finally {
-    console.log = oldLog;
-    console.error = oldError;
+  expect(error).toBeInstanceOf(RatchetError);
+  for (const fragment of fragments) {
+    expect((error as Error).message).toContain(fragment);
   }
-}
-
-async function withPrompt<T>(
-  answers: Array<string | null>,
-  callback: () => Promise<T>,
-): Promise<T> {
-  const oldPrompt = globalThis.prompt;
-  let index = 0;
-  const replacement: typeof prompt = () => answers[index++] ?? null;
-
-  try {
-    Object.defineProperty(globalThis, "prompt", {
-      configurable: true,
-      value: replacement,
-    });
-    return await callback();
-  } finally {
-    Object.defineProperty(globalThis, "prompt", {
-      configurable: true,
-      value: oldPrompt,
-    });
-  }
-}
-
-async function withRandomValues<T>(values: number[], callback: () => Promise<T>): Promise<T> {
-  const oldRandom = Math.random;
-  let index = 0;
-
-  try {
-    Math.random = () => values[index++] ?? 0;
-    return await callback();
-  } finally {
-    Math.random = oldRandom;
-  }
-}
-
-function restoreEnv(name: string, value: string | undefined): void {
-  if (value === undefined) {
-    delete Bun.env[name];
-    return;
-  }
-
-  Bun.env[name] = value;
-}
-
-async function tableExists(sql: SQL, name: string): Promise<boolean> {
-  const rows = await sql<{ name: string }[]>`
-    SELECT name
-    FROM sqlite_master
-    WHERE type = 'table' AND name = ${name}
-  `;
-  return rows.length > 0;
-}
-
-async function migrationNames(sql: SQL): Promise<string[]> {
-  const rows = await sql<{ name: string }[]>`
-    SELECT name
-    FROM ratchet_migrations
-    ORDER BY name
-  `;
-  return rows.map((row) => row.name);
-}
-
-async function expectRejectsWith(
-  promise: Promise<unknown>,
-  expected: string | string[],
-): Promise<void> {
-  const messages = Array.isArray(expected) ? expected : [expected];
-
-  try {
-    await promise;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    for (const expectedMessage of messages) {
-      expect(message).toContain(expectedMessage);
-    }
-    return;
-  }
-
-  throw new Error(`expected promise to reject with ${messages.join(", ")}`);
 }

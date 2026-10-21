@@ -1,4 +1,4 @@
-export { RatchetError, getMigrationStatus, migrate } from "./migrator.ts";
+export { getMigrationStatus, migrate, MigrationError, RatchetError } from "./migrator.ts";
 export type {
   ChangedMigration,
   MigrateOptions,
@@ -6,5 +6,4 @@ export type {
   MigrationFile,
   MigrationRecord,
   MigrationStatus,
-  RatchetConnection,
 } from "./migrator.ts";

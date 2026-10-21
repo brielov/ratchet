@@ -1,73 +1,31 @@
 import { Glob, type SQL } from "bun";
-import type { Database as SQLiteDatabase } from "bun:sqlite";
-import { basename, join } from "node:path";
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { containsSql, splitSqliteStatements } from "./statements.ts";
 
 export const DEFAULT_DIRECTORY = "migrations";
 export const DEFAULT_TABLE = "ratchet_migrations";
-export const INIT_MIGRATION_NAME = "0000_ratchet.sql";
 
-const IDENTIFIER_PATTERN = /^[a-z_][a-z0-9_]*$/;
-const MIGRATION_NUMBER_PATTERN = /^(\d+)_.*\.sql$/;
-const MIGRATION_FILE_PATTERN = /^\d+_(.+)\.sql$/;
-const BOOTSTRAP_TABLE_PATTERN = /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/i;
-
-const ADJECTIVES = [
-  "able",
-  "brave",
-  "calm",
-  "clean",
-  "direct",
-  "fresh",
-  "plain",
-  "quick",
-  "solid",
-  "steady",
-] as const;
-
-const VERBS = [
-  "building",
-  "checking",
-  "drafting",
-  "growing",
-  "moving",
-  "planning",
-  "shaping",
-  "sorting",
-  "testing",
-  "working",
-] as const;
-
-const NOUNS = [
-  "anchor",
-  "atlas",
-  "bridge",
-  "candle",
-  "compass",
-  "harbor",
-  "index",
-  "kernel",
-  "ledger",
-  "signal",
-] as const;
+const TABLE_PATTERN = /^[a-z_][a-z0-9_]*$/;
+const FILE_PATTERN = /^(\d+)_.+\.sql$/;
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+// GET_LOCK has no portable "wait forever": MySQL accepts -1, MariaDB returns NULL.
+const MYSQL_LOCK_TIMEOUT_SECONDS = 365 * 24 * 60 * 60;
 
 export type MigrateOptions = {
   table?: string;
 };
 
-export type RatchetConnection = SQL | SQLiteDatabase;
-
 export type MigrationFile = {
   name: string;
   path: string;
   checksum: string;
-  empty: boolean;
 };
 
 export type MigrationRecord = {
   name: string;
   checksum: string;
-  applied_at?: Date | string;
+  appliedAt: Date;
 };
 
 export type ChangedMigration = {
@@ -77,28 +35,17 @@ export type ChangedMigration = {
 };
 
 export type MigrateResult = {
-  directory: string;
-  table: string;
   applied: string[];
-  skipped: string[];
+  alreadyApplied: string[];
 };
 
 export type MigrationStatus = {
-  directory: string;
-  table: string;
-  tableOk: boolean;
-  tableError?: string;
   files: MigrationFile[];
-  applied: MigrationRecord[];
+  records: MigrationRecord[];
   pending: MigrationFile[];
   changed: ChangedMigration[];
   missing: MigrationRecord[];
-};
-
-export type InitMigrationResult = {
-  directory: string;
-  path: string;
-  table: string;
+  outOfOrder: MigrationFile[];
 };
 
 export type CreateMigrationResult = {
@@ -107,122 +54,163 @@ export type CreateMigrationResult = {
   name: string;
 };
 
+type Dialect = "postgres" | "mysql" | "sqlite";
+
+type Migration = MigrationFile & {
+  version: bigint;
+  sql: string;
+  // Checksum of the bytes on disk, before line-ending normalization. Accepted
+  // so records written by ratchet <= 0.3 keep matching.
+  rawChecksum: string;
+};
+
+type Plan = {
+  done: Migration[];
+  pending: Migration[];
+  changed: ChangedMigration[];
+  missing: MigrationRecord[];
+  outOfOrder: Migration[];
+};
+
 export class RatchetError extends Error {
   override name = "RatchetError";
 }
 
+/**
+ * Thrown when a migration file fails to execute. That file's transaction was
+ * rolled back; the files listed in `applied` were committed before it. The
+ * original database error is available as `cause`.
+ */
+export class MigrationError extends RatchetError {
+  override name = "MigrationError";
+  readonly migration: string;
+  readonly applied: string[];
+
+  constructor(migration: string, applied: string[], message: string, cause: unknown) {
+    super(message, { cause });
+    this.migration = migration;
+    this.applied = applied;
+  }
+}
+
+/**
+ * Applies every pending migration in `directory`, in version order, one
+ * transaction per file. Concurrent callers against the same database are
+ * serialized with a database lock. Does not close `sql`.
+ */
 export async function migrate(
-  sql: RatchetConnection,
-  directory: string,
+  sql: SQL,
+  directory = DEFAULT_DIRECTORY,
   options: MigrateOptions = {},
 ): Promise<MigrateResult> {
   const table = normalizeTable(options.table);
-  const files = await readMigrationFiles(directory);
+  const dialect = dialectOf(sql);
+  const migrations = await readMigrations(directory);
 
-  await assertBootstrapTableMatches(files, table);
+  return withMigrationLock(sql, dialect, table, async (conn) => {
+    await conn`
+      CREATE TABLE IF NOT EXISTS ${conn(table)} (
+        name VARCHAR(255) PRIMARY KEY,
+        checksum VARCHAR(64) NOT NULL,
+        applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
 
-  let records: MigrationRecord[];
+    const plan = planMigrations(migrations, await readRecords(conn, table));
+    assertPlanIsClean(plan, directory);
 
-  try {
-    records = await readMigrationRecords(sql, table);
-  } catch (error) {
-    const hasBootstrapMigration = files[0]?.name === INIT_MIGRATION_NAME;
-    if (hasBootstrapMigration && isMissingMigrationTableError(error, table)) {
-      return applyPendingMigrations(sql, table, directory, files, []);
+    const applied: string[] = [];
+    const alreadyApplied = plan.done.map((migration) => migration.name);
+
+    for (const migration of plan.pending) {
+      let ran: boolean;
+      try {
+        ran = await applyMigration(conn, dialect, table, migration);
+      } catch (error) {
+        throw error instanceof RatchetError
+          ? error
+          : migrationError(migration, applied, dialect, error);
+      }
+      (ran ? applied : alreadyApplied).push(migration.name);
     }
 
-    throw tableReadError(table, directory, error, hasBootstrapMigration);
-  }
-
-  return applyPendingMigrations(sql, table, directory, files, records);
+    return { applied, alreadyApplied };
+  });
 }
 
+/**
+ * Compares the migration directory with the database without changing
+ * either. A missing metadata table is reported as nothing applied.
+ */
 export async function getMigrationStatus(
-  sql: RatchetConnection,
-  directory: string,
+  sql: SQL,
+  directory = DEFAULT_DIRECTORY,
   options: MigrateOptions = {},
 ): Promise<MigrationStatus> {
   const table = normalizeTable(options.table);
-  const files = await readMigrationFiles(directory);
-
-  try {
-    const records = await readMigrationRecords(sql, table);
-    return buildStatus(directory, table, files, records, true);
-  } catch (error) {
-    return buildStatus(directory, table, files, [], false, String(error));
-  }
-}
-
-export async function initMigrationDirectory(
-  directory = DEFAULT_DIRECTORY,
-  table = DEFAULT_TABLE,
-): Promise<InitMigrationResult> {
-  const normalizedTable = normalizeTable(table);
-  await mkdir(directory, { recursive: true });
-
-  const path = join(directory, INIT_MIGRATION_NAME);
-  if (await Bun.file(path).exists()) {
-    throw initMigrationExistsError(path, directory);
-  }
-
-  await Bun.write(path, buildInitSql(normalizedTable));
+  const dialect = dialectOf(sql);
+  const migrations = await readMigrations(directory);
+  const records = (await tableExists(sql, dialect, table)) ? await readRecords(sql, table) : [];
+  const plan = planMigrations(migrations, records);
 
   return {
-    directory,
-    path,
-    table: normalizedTable,
+    files: migrations.map(toMigrationFile),
+    records,
+    pending: plan.pending.map(toMigrationFile),
+    changed: plan.changed,
+    missing: plan.missing,
+    outOfOrder: plan.outOfOrder.map(toMigrationFile),
   };
 }
 
+/** Writes an empty `NNNN_<name>.sql` file numbered after the highest existing version. */
 export async function createMigrationFile(
   directory = DEFAULT_DIRECTORY,
-  title?: string,
+  title: string,
 ): Promise<CreateMigrationResult> {
-  await mkdir(directory, { recursive: true });
-
-  const files = await readMigrationFileNames(directory);
-  const nextNumber = nextMigrationNumber(files);
-  const slug = title === undefined ? uniqueRandomMigrationName(files) : slugifyMigrationName(title);
-  const name = `${String(nextNumber).padStart(4, "0")}_${slug}.sql`;
-  const path = join(directory, name);
-
-  if (await Bun.file(path).exists()) {
-    throw createMigrationExistsError(path);
+  const slug = slugifyMigrationName(title);
+  if (slug === "") {
+    throw new RatchetError(
+      `invalid migration name "${title}"; use letters or numbers, for example \`ratchet create add_users\`.`,
+    );
   }
 
-  await Bun.write(path, "");
+  await mkdir(directory, { recursive: true });
 
-  return {
-    directory,
-    path,
-    name,
-  };
-}
+  let highest = 0n;
+  for (const name of await listSqlFiles(directory)) {
+    const match = FILE_PATTERN.exec(name);
+    if (match && BigInt(match[1]!) > highest) {
+      highest = BigInt(match[1]!);
+    }
+  }
 
-export function buildInitSql(table = DEFAULT_TABLE): string {
-  const normalizedTable = normalizeTable(table);
+  const name = `${String(highest + 1n).padStart(4, "0")}_${slug}.sql`;
+  const path = join(directory, name);
 
-  return `CREATE TABLE IF NOT EXISTS ${normalizedTable} (
-  name VARCHAR(255) PRIMARY KEY,
-  checksum VARCHAR(64) NOT NULL,
-  applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`;
+  try {
+    await writeFile(path, "", { flag: "wx" });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new RatchetError(`${path} already exists; choose a different migration name.`);
+    }
+    throw error;
+  }
+
+  return { directory, path, name };
 }
 
 export function slugifyMigrationName(input: string): string {
-  const slug = input
+  return input
     .trim()
     .toLowerCase()
     .replace(/['"]/g, "")
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
-
-  return slug || randomMigrationName();
 }
 
 export function normalizeTable(table = DEFAULT_TABLE): string {
-  if (!IDENTIFIER_PATTERN.test(table)) {
+  if (!TABLE_PATTERN.test(table)) {
     throw new RatchetError(
       `invalid migration table "${table}"; use a simple unquoted SQL identifier like "${DEFAULT_TABLE}". Table names must start with a lowercase letter or underscore and contain only lowercase letters, numbers, and underscores.`,
     );
@@ -231,218 +219,275 @@ export function normalizeTable(table = DEFAULT_TABLE): string {
   return table;
 }
 
-async function applyPendingMigrations(
-  sql: RatchetConnection,
-  table: string,
-  directory: string,
-  files: MigrationFile[],
-  records: MigrationRecord[],
-): Promise<MigrateResult> {
-  const filesByName = new Map(files.map((file) => [file.name, file]));
-  const appliedByName = new Map(records.map((record) => [record.name, record]));
-  const latestAppliedName = latestMigrationRecordName(records);
-  const skipped: string[] = [];
-  const pending: MigrationFile[] = [];
-  const changed: ChangedMigration[] = [];
-  const outOfOrder: MigrationFile[] = [];
-  const missing = records.filter((record) => !filesByName.has(record.name));
+function dialectOf(sql: SQL): Dialect {
+  const adapter = (sql.options as { adapter?: string }).adapter ?? "postgres";
 
-  if (missing.length > 0) {
-    throw missingMigrationFileError(directory, missing);
+  switch (adapter) {
+    case "postgres":
+    case "sqlite":
+      return adapter;
+    case "mysql":
+    case "mariadb":
+      return "mysql";
+    default:
+      throw new RatchetError(`unsupported Bun.SQL adapter "${adapter}".`);
   }
-
-  for (const file of files) {
-    const record = appliedByName.get(file.name);
-
-    if (!record) {
-      pending.push(file);
-      if (latestAppliedName !== undefined && file.name.localeCompare(latestAppliedName) < 0) {
-        outOfOrder.push(file);
-      }
-      continue;
-    }
-
-    if (record.checksum !== file.checksum) {
-      changed.push({
-        name: file.name,
-        expected: record.checksum,
-        actual: file.checksum,
-      });
-      continue;
-    }
-
-    skipped.push(file.name);
-  }
-
-  if (changed.length > 0) {
-    throw checksumError(changed);
-  }
-
-  if (outOfOrder.length > 0 && latestAppliedName !== undefined) {
-    throw outOfOrderMigrationError(outOfOrder, latestAppliedName);
-  }
-
-  if (pending.length > 0) {
-    await applyPendingMigrationFiles(sql, table, pending);
-  }
-
-  return {
-    directory,
-    table,
-    applied: pending.map((file) => file.name),
-    skipped,
-  };
 }
 
-function buildStatus(
-  directory: string,
+/**
+ * Runs `fn` while holding a lock that excludes other migrators. PostgreSQL and
+ * MySQL use a session-level advisory lock on a reserved connection, which the
+ * server releases on its own if the process dies. SQLite has no session lock;
+ * each migration runs in a BEGIN IMMEDIATE transaction and re-checks the
+ * metadata table instead, and a busy timeout makes writers wait their turn.
+ */
+async function withMigrationLock<T>(
+  sql: SQL,
+  dialect: Dialect,
   table: string,
-  files: MigrationFile[],
-  records: MigrationRecord[],
-  tableOk: boolean,
-  tableError?: string,
-): MigrationStatus {
-  const filesByName = new Map(files.map((file) => [file.name, file]));
-  const recordsByName = new Map(records.map((record) => [record.name, record]));
-  const pending: MigrationFile[] = [];
-  const changed: ChangedMigration[] = [];
-  const missing: MigrationRecord[] = [];
-
-  for (const file of files) {
-    const record = recordsByName.get(file.name);
-
-    if (!record) {
-      pending.push(file);
-      continue;
-    }
-
-    if (record.checksum !== file.checksum) {
-      changed.push({
-        name: file.name,
-        expected: record.checksum,
-        actual: file.checksum,
-      });
-    }
+  fn: (conn: SQL) => Promise<T>,
+): Promise<T> {
+  if (dialect === "sqlite") {
+    return withSqliteBusyTimeout(sql, () => fn(sql));
   }
 
-  for (const record of records) {
-    if (!filesByName.has(record.name)) {
-      missing.push(record);
+  const conn = await sql.reserve();
+  try {
+    if (dialect === "postgres") {
+      const key = postgresLockKey(table);
+      await conn`SELECT pg_advisory_lock(${key}::bigint)`;
+      try {
+        return await fn(conn);
+      } finally {
+        await conn`SELECT pg_advisory_unlock(${key}::bigint)`.catch(() => {});
+      }
     }
-  }
 
-  return {
-    directory,
-    table,
-    tableOk,
-    tableError,
-    files,
-    applied: records,
-    pending,
-    changed,
-    missing,
-  };
+    const [row] = await conn<{ acquired: number | null }[]>`
+      SELECT GET_LOCK(SHA2(CONCAT('ratchet:', IFNULL(DATABASE(), ''), ':', ${table}), 256), ${MYSQL_LOCK_TIMEOUT_SECONDS}) AS acquired
+    `;
+    if (Number(row?.acquired) !== 1) {
+      throw new RatchetError(`could not acquire the MySQL migration lock for "${table}".`);
+    }
+    try {
+      return await fn(conn);
+    } finally {
+      await conn`
+        SELECT RELEASE_LOCK(SHA2(CONCAT('ratchet:', IFNULL(DATABASE(), ''), ':', ${table}), 256))
+      `.catch(() => {});
+    }
+  } finally {
+    conn.release();
+  }
 }
 
-async function applyPendingMigrationFiles(
-  sql: RatchetConnection,
-  table: string,
-  pending: MigrationFile[],
-): Promise<void> {
-  if (isSQLiteDatabase(sql)) {
-    const migrations = await Promise.all(
-      pending.map(async (file) => ({
-        file,
-        contents: file.empty ? "" : await Bun.file(file.path).text(),
-      })),
-    );
-
-    const apply = sql.transaction(
-      (items: Array<{ file: MigrationFile; contents: string }>) => {
-        for (const item of items) {
-          if (item.contents.length > 0) {
-            sql.run(item.contents);
-          }
-          sql
-            .query(`INSERT INTO ${table} (name, checksum) VALUES ($name, $checksum)`)
-            .run({
-              $name: item.file.name,
-              $checksum: item.file.checksum,
-            });
-        }
-      },
-    );
-
-    apply(migrations);
-    return;
+async function withSqliteBusyTimeout<T>(sql: SQL, fn: () => Promise<T>): Promise<T> {
+  const [row] = await sql<{ timeout: number }[]>`PRAGMA busy_timeout`;
+  if (Number(row?.timeout) > 0) {
+    return fn();
   }
 
-  await sql.begin(async (tx) => {
-    for (const file of pending) {
-      if (!file.empty) {
-        await tx.file(file.path);
+  await sql.unsafe(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+  try {
+    return await fn();
+  } finally {
+    await sql.unsafe("PRAGMA busy_timeout = 0").catch(() => {});
+  }
+}
+
+/** Returns false when another migrator recorded this file after we planned. */
+async function applyMigration(
+  conn: SQL,
+  dialect: Dialect,
+  table: string,
+  migration: Migration,
+): Promise<boolean> {
+  const run = async (tx: SQL): Promise<boolean> => {
+    const [existing] = await tx<{ checksum: string }[]>`
+      SELECT checksum FROM ${tx(table)} WHERE name = ${migration.name}
+    `;
+    if (existing) {
+      if (!checksumMatches(existing.checksum, migration)) {
+        throw checksumError([
+          { name: migration.name, expected: existing.checksum, actual: migration.checksum },
+        ]);
       }
-      await tx`
-        INSERT INTO ${tx(table)} (name, checksum)
-        VALUES (${file.name}, ${file.checksum})
+      return false;
+    }
+
+    for (const statement of statementsFor(dialect, migration.sql)) {
+      await tx.unsafe(statement).simple();
+    }
+
+    await tx`
+      INSERT INTO ${tx(table)} (name, checksum)
+      VALUES (${migration.name}, ${migration.checksum})
+    `;
+    return true;
+  };
+
+  return dialect === "sqlite" ? conn.begin("immediate", run) : conn.begin(run);
+}
+
+function statementsFor(dialect: Dialect, sql: string): string[] {
+  if (dialect === "sqlite") {
+    return splitSqliteStatements(sql);
+  }
+
+  return containsSql(sql) ? [sql] : [];
+}
+
+async function tableExists(sql: SQL, dialect: Dialect, table: string): Promise<boolean> {
+  let rows: { present: unknown }[];
+
+  switch (dialect) {
+    case "postgres":
+      rows = await sql`SELECT to_regclass(${table}) IS NOT NULL AS present`;
+      break;
+    case "mysql":
+      rows = await sql`
+        SELECT COUNT(*) > 0 AS present
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = ${table}
       `;
-    }
-  });
-}
-
-async function readMigrationRecords(
-  sql: RatchetConnection,
-  table: string,
-): Promise<MigrationRecord[]> {
-  if (isSQLiteDatabase(sql)) {
-    return sql
-      .query(
-        `SELECT name, checksum, applied_at
-         FROM ${table}
-         ORDER BY name`,
-      )
-      .all() as MigrationRecord[];
+      break;
+    case "sqlite":
+      rows = await sql`
+        SELECT COUNT(*) > 0 AS present
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ${table}
+      `;
+      break;
   }
 
-  return await sql<MigrationRecord[]>`
-    SELECT name, checksum, applied_at
-    FROM ${sql(table)}
-    ORDER BY name
-  `;
+  const present = rows[0]?.present;
+  return present === true || Number(present) === 1;
 }
 
-async function readMigrationFiles(directory: string): Promise<MigrationFile[]> {
+async function readRecords(sql: SQL, table: string): Promise<MigrationRecord[]> {
+  const rows = await sql<{ name: string; checksum: string; applied_at: unknown }[]>`
+    SELECT name, checksum, applied_at FROM ${sql(table)}
+  `;
+  return rows
+    .map((row) => ({ name: row.name, checksum: row.checksum, appliedAt: toDate(row.applied_at) }))
+    .sort((left, right) => compareNames(left.name, right.name));
+}
+
+function planMigrations(migrations: Migration[], records: MigrationRecord[]): Plan {
+  const recordsByName = new Map(records.map((record) => [record.name, record]));
+  const names = new Set(migrations.map((migration) => migration.name));
+  const plan: Plan = { done: [], pending: [], changed: [], missing: [], outOfOrder: [] };
+  let latestApplied: bigint | undefined;
+
+  for (const migration of migrations) {
+    const record = recordsByName.get(migration.name);
+
+    if (!record) {
+      plan.pending.push(migration);
+      continue;
+    }
+
+    latestApplied = migration.version;
+
+    if (checksumMatches(record.checksum, migration)) {
+      plan.done.push(migration);
+    } else {
+      plan.changed.push({
+        name: migration.name,
+        expected: record.checksum,
+        actual: migration.checksum,
+      });
+    }
+  }
+
+  if (latestApplied !== undefined) {
+    const latest = latestApplied;
+    plan.outOfOrder = plan.pending.filter((migration) => migration.version < latest);
+  }
+
+  plan.missing = records.filter((record) => !names.has(record.name));
+  return plan;
+}
+
+function assertPlanIsClean(plan: Plan, directory: string): void {
+  if (plan.missing.length > 0) {
+    const names = plan.missing.map((record) => record.name).join(", ");
+    throw new RatchetError(
+      `applied migration file missing: ${names}. Restore the missing file(s) to ${directory} from version control before running migrations. If this database is disposable, recreate it and run migrations from scratch.`,
+    );
+  }
+
+  if (plan.changed.length > 0) {
+    throw checksumError(plan.changed);
+  }
+
+  if (plan.outOfOrder.length > 0) {
+    const names = plan.outOfOrder.map((migration) => migration.name).join(", ");
+    const latest = plan.done.at(-1)?.name;
+    throw new RatchetError(
+      `pending migration sorts before applied migration ${latest}: ${names}. Migrations are forward-only and must run in version order; renumber the pending file(s) to come after ${latest}, or rebuild this database before applying them.`,
+    );
+  }
+}
+
+async function readMigrations(directory: string): Promise<Migration[]> {
   await assertDirectory(directory);
 
-  const names = await readMigrationFileNames(directory);
-  const files = await Promise.all(
-    names.map(async (name) => {
+  const names = await listSqlFiles(directory);
+  const invalid = names.filter((name) => !FILE_PATTERN.test(name));
+  if (invalid.length > 0) {
+    throw new RatchetError(
+      `invalid migration file name: ${invalid.join(", ")}. Migration files must be named <version>_<name>.sql, for example 0001_add_users.sql; move other .sql files out of ${directory}.`,
+    );
+  }
+
+  const migrations = await Promise.all(
+    names.map(async (name): Promise<Migration> => {
       const path = join(directory, name);
-      const contents = await Bun.file(path).text();
+      const raw = await Bun.file(path).text();
+      const sql = raw.replace(/^﻿/, "").replace(/\r\n/g, "\n");
 
       return {
         name,
         path,
-        checksum: sha256(contents),
-        empty: contents.trim().length === 0,
+        version: BigInt(FILE_PATTERN.exec(name)![1]!),
+        sql,
+        checksum: sha256(sql),
+        rawChecksum: sha256(raw),
       };
     }),
   );
 
-  return files.sort(compareMigrationNames);
-}
+  migrations.sort((left, right) =>
+    left.version === right.version
+      ? compareNames(left.name, right.name)
+      : left.version < right.version
+        ? -1
+        : 1,
+  );
 
-async function readMigrationFileNames(directory: string): Promise<string[]> {
-  await assertDirectory(directory);
-
-  const glob = new Glob("*.sql");
-  const names: string[] = [];
-
-  for await (const path of glob.scan({ cwd: directory, onlyFiles: true })) {
-    names.push(basename(path));
+  const duplicates = migrations.filter(
+    (migration, index) =>
+      migrations[index - 1]?.version === migration.version ||
+      migrations[index + 1]?.version === migration.version,
+  );
+  if (duplicates.length > 0) {
+    throw new RatchetError(
+      `duplicate migration version: ${duplicates.map((migration) => migration.name).join(", ")}. Each migration needs a unique version number; renumber the file that has not been applied yet.`,
+    );
   }
 
-  return names.sort((left, right) => left.localeCompare(right));
+  return migrations;
+}
+
+async function listSqlFiles(directory: string): Promise<string[]> {
+  const names: string[] = [];
+
+  for await (const name of new Glob("*.sql").scan({ cwd: directory, onlyFiles: true })) {
+    names.push(name);
+  }
+
+  return names.sort(compareNames);
 }
 
 async function assertDirectory(directory: string): Promise<void> {
@@ -453,7 +498,7 @@ async function assertDirectory(directory: string): Promise<void> {
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       throw new RatchetError(
-        `migration directory not found: ${directory}; run \`ratchet init --dir ${directory}\` or pass the directory that contains your *.sql migrations with --dir.`,
+        `migration directory not found: ${directory}; create your first migration with \`ratchet create <name> --dir ${directory}\`, or pass the directory that contains your *.sql migrations with --dir.`,
       );
     }
 
@@ -462,51 +507,46 @@ async function assertDirectory(directory: string): Promise<void> {
 
   if (!info.isDirectory()) {
     throw new RatchetError(
-      `${directory} is not a directory; pass the directory that contains your *.sql migrations with --dir, or remove this path and run \`ratchet init --dir ${directory}\`.`,
+      `${directory} is not a directory; pass the directory that contains your *.sql migrations with --dir.`,
     );
   }
 }
 
-async function assertBootstrapTableMatches(
-  files: MigrationFile[],
-  table: string,
-): Promise<void> {
-  const bootstrap = files[0];
-  if (bootstrap?.name !== INIT_MIGRATION_NAME) {
-    return;
-  }
-
-  const contents = await Bun.file(bootstrap.path).text();
-  const match = BOOTSTRAP_TABLE_PATTERN.exec(contents);
-  if (!match) {
-    return;
-  }
-
-  const bootstrapTable = match[1];
-  if (bootstrapTable === table) {
-    return;
-  }
-
-  throw new RatchetError(
-    `bootstrap migration ${bootstrap.name} creates table "${bootstrapTable}", but the configured table is "${table}". Pass --table ${bootstrapTable} (or set RATCHET_TABLE), or recreate the migration directory with the desired table.`,
+function migrationError(
+  migration: Migration,
+  applied: string[],
+  dialect: Dialect,
+  cause: unknown,
+): MigrationError {
+  const hint =
+    dialect === "mysql"
+      ? " (MySQL commits DDL statements implicitly, so statements in this file that ran before the failure may not have been rolled back)"
+      : "";
+  return new MigrationError(
+    migration.name,
+    applied,
+    `migration ${migration.name} failed: ${errorMessage(cause)}${hint}`,
+    cause,
   );
 }
 
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
-}
+// PostgreSQL and MySQL return a Date. SQLite returns CURRENT_TIMESTAMP as
+// "YYYY-MM-DD HH:MM:SS" text, which is UTC.
+function toDate(value: unknown): Date {
+  if (value instanceof Date) {
+    return value;
+  }
 
-function sha256(input: string): string {
-  return new Bun.CryptoHasher("sha256").update(input).digest("hex");
-}
-
-function isSQLiteDatabase(sql: RatchetConnection): sql is SQLiteDatabase {
-  return (
-    "query" in sql &&
-    typeof sql.query === "function" &&
-    "run" in sql &&
-    typeof sql.run === "function"
+  const text = String(value);
+  return new Date(
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(text)
+      ? `${text.replace(" ", "T")}Z`
+      : text,
   );
+}
+
+function checksumMatches(recorded: string, migration: Migration): boolean {
+  return recorded === migration.checksum || recorded === migration.rawChecksum;
 }
 
 function checksumError(changed: ChangedMigration[]): RatchetError {
@@ -516,169 +556,28 @@ function checksumError(changed: ChangedMigration[]): RatchetError {
   );
 }
 
-function missingMigrationFileError(directory: string, missing: MigrationRecord[]): RatchetError {
-  const names = missing.map((record) => record.name).join(", ");
-  return new RatchetError(
-    `applied migration file missing: ${names}. Restore the missing file(s) to ${directory} from version control before running migrations. If this database is disposable, recreate it and run migrations from scratch.`,
-  );
+function toMigrationFile(migration: Migration): MigrationFile {
+  return { name: migration.name, path: migration.path, checksum: migration.checksum };
 }
 
-function outOfOrderMigrationError(
-  outOfOrder: MigrationFile[],
-  latestAppliedName: string,
-): RatchetError {
-  const names = outOfOrder.map((file) => file.name).join(", ");
-  return new RatchetError(
-    `pending migration sorts before applied migration ${latestAppliedName}: ${names}. Forward-only migrations must run in lexicographic order; rename the pending file(s) with a prefix after ${latestAppliedName}, or rebuild this database before applying them.`,
-  );
+// Plain code-unit comparison; localeCompare depends on the machine's locale.
+function compareNames(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function tableReadError(
-  table: string,
-  directory: string,
-  cause: unknown,
-  hasBootstrapMigration: boolean,
-): RatchetError {
-  const detail = hasBootstrapMigration
-    ? `Ratchet found ${INIT_MIGRATION_NAME}, but it only bootstraps when the metadata table is missing. Check that "${table}" has the expected name, checksum, and applied_at columns.`
-    : `Ratchet also did not find ${INIT_MIGRATION_NAME} as the first migration in ${directory}, so it cannot bootstrap the metadata table. Run \`ratchet init --dir ${directory} --table ${table}\`, or check --dir, --table, and --url if this database was already initialized.`;
-  const error = new RatchetError(
-    `could not read migration table "${table}". ${detail}`,
-  );
-  error.cause = cause;
-  return error;
+function postgresLockKey(table: string): string {
+  const hex = sha256(`ratchet:${table}`).slice(0, 16);
+  return BigInt.asIntN(64, BigInt(`0x${hex}`)).toString();
 }
 
-function isMissingMigrationTableError(error: unknown, table: string): boolean {
-  const code = errorCode(error);
-  const message = errorMessage(error).toLowerCase();
-  const normalizedTable = table.toLowerCase();
-
-  if (message.includes(`no such table: ${normalizedTable}`)) {
-    return true;
-  }
-
-  if (code === "SQLITE_ERROR") {
-    return message.includes(`no such table: ${normalizedTable}`);
-  }
-
-  if (code === "ER_NO_SUCH_TABLE") {
-    return true;
-  }
-
-  if (code === "42P01") {
-    return true;
-  }
-
-  if (code === "ERR_POSTGRES_SERVER_ERROR") {
-    return message.includes(`relation "${normalizedTable}" does not exist`);
-  }
-
-  return false;
+function sha256(input: string): string {
+  return new Bun.CryptoHasher("sha256").update(input).digest("hex");
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null || !("code" in error)) {
-    return undefined;
-  }
-
-  const code = error.code;
-  return typeof code === "string" ? code : undefined;
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function initMigrationExistsError(path: string, directory: string): RatchetError {
-  return new RatchetError(
-    `${path} already exists; this migration directory is already initialized. Use \`ratchet create <name> --dir ${directory}\` to add another migration.`,
-  );
-}
-
-function createMigrationExistsError(path: string): RatchetError {
-  return new RatchetError(
-    `${path} already exists; choose a different migration name or remove the existing file before retrying.`,
-  );
-}
-
-function nextMigrationNumber(names: string[]): number {
-  let highest = 0;
-
-  for (const name of names) {
-    const match = MIGRATION_NUMBER_PATTERN.exec(name);
-    if (!match) {
-      continue;
-    }
-
-    highest = Math.max(highest, Number(match[1]));
-  }
-
-  return highest + 1;
-}
-
-function uniqueRandomMigrationName(names: string[]): string {
-  const used = new Set(names.map(migrationNameSlug).filter(isDefined));
-  const attempts = ADJECTIVES.length * VERBS.length * NOUNS.length;
-
-  for (let index = 0; index < attempts; index += 1) {
-    const name = randomMigrationName();
-    if (!used.has(name)) {
-      return name;
-    }
-  }
-
-  for (const adjective of ADJECTIVES) {
-    for (const verb of VERBS) {
-      for (const noun of NOUNS) {
-        const name = `${adjective}_${verb}_${noun}`;
-        if (!used.has(name)) {
-          return name;
-        }
-      }
-    }
-  }
-
-  for (let index = names.length + 1; ; index += 1) {
-    const name = `migration_${index}`;
-    if (!used.has(name)) {
-      return name;
-    }
-  }
-}
-
-function migrationNameSlug(name: string): string | undefined {
-  return MIGRATION_FILE_PATTERN.exec(name)?.[1];
-}
-
-function randomMigrationName(): string {
-  const adjective = pick(ADJECTIVES);
-  const verb = pick(VERBS);
-  const noun = pick(NOUNS);
-  return `${adjective}_${verb}_${noun}`;
-}
-
-function pick<const T>(items: readonly T[]): T {
-  // Caller passes a non-empty `as const` tuple, so the index is always in range.
-  return items[Math.floor(Math.random() * items.length)]!;
-}
-
-function isDefined<T>(value: T | undefined): value is T {
-  return value !== undefined;
-}
-
-function latestMigrationRecordName(records: MigrationRecord[]): string | undefined {
-  let latest: string | undefined;
-
-  for (const record of records) {
-    if (latest === undefined || record.name.localeCompare(latest) > 0) {
-      latest = record.name;
-    }
-  }
-
-  return latest;
-}
-
-function compareMigrationNames(left: MigrationFile, right: MigrationFile): number {
-  return left.name.localeCompare(right.name);
 }
